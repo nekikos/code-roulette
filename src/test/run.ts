@@ -3,6 +3,8 @@
  */
 import * as assert from 'assert';
 import { findFunctions, indentAt } from '../parser';
+import { makeEvent, summarize, suspiciousLines, isBigInsert, describeEvent } from '../journal';
+import { allowedIndexes, pickTargets, hintLines, newAchievements, createExam, checkPin, examFinished, examAllWon, buildReport } from '../modes';
 import { canTransition, pickIndex, pushRecent, formatTime, emptyStats, updateStats, placeholderBody, looksLikeOriginal } from '../game';
 
 let passed = 0;
@@ -179,6 +181,127 @@ test('обычный набор кода — не чит', () => {
 
 test('большая вставка своего (другого) кода — не чит', () => {
     assert.ok(!looksLikeOriginal('int total = 0;\nfor (int k = 0; k < n; ++k) total += a[k];\nreturn total;', original));
+});
+
+// ---------- журнал ----------
+
+test('журнал: итоги и подозрительные моменты', () => {
+    const events = [
+        makeEvent(0, 'start', 0, 'sum'),
+        makeEvent(30, 'focus', 45, ''),
+        makeEvent(80, 'focus', 15, ''),
+        makeEvent(90, 'paste', 120, ''),
+        makeEvent(100, 'cheat', 0, 'sum'),
+        makeEvent(150, 'closed', 200, ''),
+        makeEvent(160, 'hint', 1, 'int s = 0;')
+    ];
+    const s = summarize(events);
+    assert.deepStrictEqual(s, {
+        focusLosses: 2, focusSeconds: 60, pastes: 1, pasteChars: 120,
+        cheats: 1, restarts: 1, closedSeconds: 200, hints: 1
+    });
+    const lines = suspiciousLines(s);
+    assert.strictEqual(lines.length, 5);
+    assert.ok(lines[0].indexOf('2 раз') !== -1 && lines[0].indexOf('01:00') !== -1);
+});
+
+test('журнал: чистый раунд без подозрений', () => {
+    assert.deepStrictEqual(suspiciousLines(summarize([makeEvent(0, 'start', 0, 'sum')])), []);
+});
+
+test('журнал: большая вставка и описание события', () => {
+    assert.ok(!isBigInsert('s += a[i];'));
+    assert.ok(isBigInsert('for (int i = 0; i < n; i++) { s += a[i] * a[i]; }'));
+    assert.strictEqual(describeEvent(makeEvent(135, 'paste', 120, '')), '[02:15] 📋 Вставка 120 символов');
+});
+
+// ---------- сложность ----------
+
+const funcsByLength = [
+    { name: 'a', lines: 2 }, { name: 'b', lines: 4 }, { name: 'c', lines: 6 },
+    { name: 'd', lines: 10 }, { name: 'e', lines: 20 }
+];
+
+test('сложность: лёгкий — короткие, адский — длинные', () => {
+    assert.deepStrictEqual(allowedIndexes(funcsByLength, 'easy'), [0, 1, 2]);
+    assert.deepStrictEqual(allowedIndexes(funcsByLength, 'medium'), [0, 1, 2, 3, 4]);
+    assert.deepStrictEqual(allowedIndexes(funcsByLength, 'hard'), [2, 3, 4]);
+});
+
+test('сложность: на адском две разные функции', () => {
+    for (let k = 0; k < 30; k++) {
+        const t = pickTargets(funcsByLength, 'hard', []);
+        assert.strictEqual(t.length, 2);
+        assert.notStrictEqual(t[0], t[1]);
+        assert.ok(funcsByLength[t[0]].lines >= 6 && funcsByLength[t[1]].lines >= 6);
+    }
+    assert.strictEqual(pickTargets([{ name: 'x', lines: 5 }], 'hard', []).length, 1);
+    assert.strictEqual(pickTargets(funcsByLength, 'medium', []).length, 1);
+    assert.deepStrictEqual(pickTargets([], 'medium', []), []);
+});
+
+test('сложность: недавние не выпадают', () => {
+    for (let k = 0; k < 30; k++) {
+        const t = pickTargets(funcsByLength, 'easy', ['a', 'b']);
+        assert.deepStrictEqual(t, [2]);
+    }
+});
+
+// ---------- подсказки ----------
+
+test('подсказки: строки оригинала без пустых и одиночных скобок', () => {
+    assert.deepStrictEqual(hintLines(original), ['int s = 0;', 'for (int i = 0; i < n; i++) {', 's += a[i];', 'return s;']);
+});
+
+// ---------- достижения ----------
+
+test('достижения: быстрая победа без подсказок на адском', () => {
+    const stats = { wins: 1, losses: 0, streak: 1, bestStreak: 1, bestSeconds: 40 };
+    const got = newAchievements({
+        win: true, seconds: 40, secondsLeft: 260, hints: 0, cheats: 0,
+        difficulty: 'hard', stats: stats, examPassed: false
+    }, []).map(a => a.id);
+    assert.deepStrictEqual(got, ['first_win', 'lightning', 'brain', 'hell']);
+});
+
+test('достижения: уже открытые не повторяются, чит даёт «Пойман»', () => {
+    const stats = { wins: 10, losses: 3, streak: 0, bestStreak: 4, bestSeconds: 40 };
+    const got = newAchievements({
+        win: false, seconds: 300, secondsLeft: 0, hints: 2, cheats: 1,
+        difficulty: 'easy', stats: stats, examPassed: false
+    }, ['marathon']).map(a => a.id);
+    assert.deepStrictEqual(got, ['busted']);
+});
+
+// ---------- экзамен ----------
+
+test('экзамен: PIN хранится только хешем', () => {
+    const exam = createExam({
+        student: 'Иванов Иван, M3118', rounds: 2, minutes: 5, difficulty: 'medium',
+        hintsAllowed: false, checkCommand: 'ctest', pin: '4821'
+    });
+    assert.ok(JSON.stringify(exam).indexOf('4821') === -1);
+    assert.ok(checkPin(exam, '4821'));
+    assert.ok(!checkPin(exam, '0000'));
+});
+
+test('экзамен: конец, итог и отчёт', () => {
+    const exam = createExam({
+        student: 'Иванов Иван, M3118', rounds: 2, minutes: 5, difficulty: 'hard',
+        hintsAllowed: true, checkCommand: '', pin: '4821'
+    }, new Date(2026, 9, 19, 14, 0).getTime());
+    exam.results.push({ functions: ['sum'], win: true, seconds: 95, total: 300, text: '', events: [makeEvent(0, 'start', 0, 'sum')] });
+    assert.ok(!examFinished(exam));
+    exam.results.push({ functions: ['merge', 'sort'], win: false, seconds: 300, total: 300, text: '',
+        events: [makeEvent(10, 'focus', 40, ''), makeEvent(20, 'paste', 200, '')] });
+    assert.ok(examFinished(exam));
+    assert.ok(!examAllWon(exam));
+    const report = buildReport(exam, 'algorithms.cpp', false, new Date(2026, 9, 19, 14, 20).getTime());
+    assert.ok(report.indexOf('Иванов Иван, M3118') !== -1);
+    assert.ok(report.indexOf('**1 из 2**') !== -1);
+    assert.ok(report.indexOf('19.10.2026 14:00') !== -1);
+    assert.ok(report.indexOf('Уходил из VS Code: 1 раз') !== -1);
+    assert.ok(report.indexOf('[00:20] 📋 Вставка 200 символов') !== -1);
 });
 
 console.log('\nВсе тесты пройдены: ' + passed);

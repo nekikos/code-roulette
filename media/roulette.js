@@ -1,4 +1,4 @@
-// Code Roulette — логика панели (колесо, таймер, кнопки).
+// Code Roulette — логика панели (колесо, таймер, кнопки, достижения).
 // Панель только показывает состояние: решения принимает плагин (extension.ts),
 // общение идёт сообщениями postMessage.
 (function () {
@@ -14,13 +14,17 @@
     const canvas = $('wheel');
     const ctx = canvas.getContext('2d');
 
-    let functions = [];      // [{ name, signature, lines }]
-    let minutes = 5;         // выбранное время
-    let rotation = 0;        // текущий поворот колеса в радианах
+    let functions = [];        // [{ name, signature, lines }]
+    let minutes = 5;           // выбранное время
+    let level = 'medium';      // выбранная сложность
+    let rotation = 0;          // текущий поворот колеса в радианах
     let spinning = false;
-    let winner = -1;         // индекс подсвеченного сектора
+    let winners = [];          // индексы подсвеченных секторов
     let soundOn = true;
-    let lightsPhase = 0;     // для мигания лампочек по краю
+    let lightsPhase = 0;       // для мигания лампочек по краю
+    let examActive = false;
+    let allAchievements = [];
+    let unlocked = [];
 
     // ---------- звук (короткие сигналы через Web Audio) ----------
     let audio = null;
@@ -47,19 +51,15 @@
         }
     }
 
-    function fanfare() {
-        const notes = [523, 659, 784, 1046];
+    function playNotes(notes, step, type, volume, length) {
         for (let i = 0; i < notes.length; i++) {
-            setTimeout(() => beep(notes[i], 0.18, 'triangle', 0.08), i * 110);
+            setTimeout(() => beep(notes[i], length, type, volume), i * step);
         }
     }
 
-    function sadTrombone() {
-        const notes = [392, 370, 349, 330];
-        for (let i = 0; i < notes.length; i++) {
-            setTimeout(() => beep(notes[i], 0.32, 'sawtooth', 0.04), i * 260);
-        }
-    }
+    const fanfare = () => playNotes([523, 659, 784, 1046], 110, 'triangle', 0.08, 0.18);
+    const sadTrombone = () => playNotes([392, 370, 349, 330], 260, 'sawtooth', 0.04, 0.32);
+    const achievementJingle = () => playNotes([784, 988, 1175, 1568], 90, 'triangle', 0.07, 0.15);
 
     // ---------- рисование колеса ----------
     function drawWheel() {
@@ -99,11 +99,12 @@
             const a0 = rotation + i * seg;
             const a1 = a0 + seg;
             const color = COLORS[i % COLORS.length];
+            const hot = winners.indexOf(i) !== -1;
 
             // сектор: тёмная заливка с градиентом к цвету
             const grad = ctx.createRadialGradient(c, c, r * 0.2, c, c, r);
             grad.addColorStop(0, '#0b0618');
-            grad.addColorStop(1, hexAlpha(color, i === winner ? 0.85 : 0.35));
+            grad.addColorStop(1, hexAlpha(color, hot ? 0.85 : 0.35));
             ctx.beginPath();
             ctx.moveTo(c, c);
             ctx.arc(c, c, r, a0, a1);
@@ -112,16 +113,15 @@
             ctx.fill();
 
             // светящаяся граница сектора
-            ctx.lineWidth = i === winner ? 6 : 3;
+            ctx.lineWidth = hot ? 6 : 3;
             ctx.strokeStyle = color;
             ctx.shadowColor = color;
-            ctx.shadowBlur = i === winner ? 30 : 12;
+            ctx.shadowBlur = hot ? 30 : 12;
             ctx.stroke();
             ctx.shadowBlur = 0;
 
             // подпись: на левой половине колеса переворачиваем, чтобы текст не был вверх ногами
             const mid = a0 + seg / 2;
-            const cos = Math.cos(mid);
             ctx.save();
             ctx.translate(c, c);
             ctx.rotate(mid);
@@ -132,7 +132,7 @@
             ctx.shadowColor = color;
             ctx.shadowBlur = 10;
             const label = shorten(functions[i].name, 14);
-            if (cos < 0) {
+            if (Math.cos(mid) < 0) {
                 ctx.rotate(Math.PI);
                 ctx.textAlign = 'left';
                 ctx.fillText(label, -(r - 22), 0);
@@ -183,25 +183,24 @@
     }
 
     // ---------- вращение ----------
-    function spinTo(index) {
+
+    // Докручивает колесо до сектора index; turns — сколько полных оборотов минимум.
+    function spinTo(index, duration, turns, onDone) {
         const n = functions.length;
         const seg = (Math.PI * 2) / n;
         // центр выбранного сектора должен оказаться под стрелкой, плюс небольшой случайный сдвиг
         const jitter = (Math.random() - 0.5) * seg * 0.6;
         let target = -Math.PI / 2 - (index + 0.5) * seg + jitter;
         const full = Math.PI * 2;
-        while (target < rotation + full * 6) {
+        while (target < rotation + full * turns) {
             target += full;
         }
         const start = rotation;
         const t0 = performance.now();
         let lastSector = sectorAtPointer();
-        spinning = true;
-        winner = -1;
-        setControlsEnabled(false);
 
         function frame(now) {
-            const t = Math.min(1, (now - t0) / SPIN_MS);
+            const t = Math.min(1, (now - t0) / duration);
             const eased = 1 - Math.pow(1 - t, 4); // плавное замедление
             rotation = start + (target - start) * eased;
             const s = sectorAtPointer();
@@ -217,14 +216,43 @@
             if (t < 1) {
                 requestAnimationFrame(frame);
             } else {
-                spinning = false;
-                winner = index;
+                winners.push(index);
                 drawWheel();
                 beep(1320, 0.25, 'triangle', 0.08);
-                setTimeout(() => vscode.postMessage({ type: 'spinDone' }), 900);
+                onDone();
             }
         }
         requestAnimationFrame(frame);
+    }
+
+    // Крутит колесо до всех выпавших секторов по очереди (на адском их два).
+    function spinAll(indexes) {
+        spinning = true;
+        winners = [];
+        setControlsEnabled(false);
+        let k = 0;
+        function next() {
+            if (k >= indexes.length) {
+                spinning = false;
+                setTimeout(() => vscode.postMessage({ type: 'spinDone' }), 900);
+                return;
+            }
+            const first = k === 0;
+            const idx = indexes[k];
+            k++;
+            if (!first) {
+                // второй сектор: баннер «двойной удар» и короткое вращение
+                const d = $('double');
+                d.classList.remove('show');
+                void d.offsetWidth;
+                d.classList.add('show');
+                playNotes([220, 330, 440], 120, 'sawtooth', 0.05, 0.2);
+                setTimeout(() => spinTo(idx, 3000, 2, next), 900);
+            } else {
+                spinTo(idx, SPIN_MS, 6, next);
+            }
+        }
+        next();
     }
 
     // ---------- экраны ----------
@@ -256,6 +284,18 @@
         $('st-best').textContent = s.bestSeconds > 0 ? formatTime(s.bestSeconds) : '—';
     }
 
+    function setExam(exam) {
+        examActive = !!exam;
+        $('exam-bar').classList.toggle('hidden', !examActive);
+        $('setup').classList.toggle('hidden', examActive); // время и сложность на экзамене задаёт практик
+        if (examActive) {
+            $('exam-student').textContent = exam.student;
+            $('exam-round').textContent = 'РАУНД ' + exam.round + '/' + exam.rounds;
+            $('exam-rules').textContent = exam.minutes + ' мин · ' + exam.difficultyName +
+                (exam.hintsAllowed ? ' · 💡 можно' : ' · 💡 нельзя');
+        }
+    }
+
     function formatTime(sec) {
         sec = Math.max(0, Math.floor(sec));
         const m = Math.floor(sec / 60);
@@ -279,7 +319,19 @@
         t.textContent = text;
         t.classList.add('show');
         clearTimeout(toast.timer);
-        toast.timer = setTimeout(() => t.classList.remove('show'), 3200);
+        toast.timer = setTimeout(() => t.classList.remove('show'), 3500);
+    }
+
+    // создаёт элемент с классом и текстом (textContent — безопасно для любых имён функций)
+    function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) {
+            e.className = cls;
+        }
+        if (text !== undefined) {
+            e.textContent = text;
+        }
+        return e;
     }
 
     // ---------- конфетти ----------
@@ -328,38 +380,98 @@
         requestAnimationFrame(frame);
     }
 
+    // ---------- достижения ----------
+    function renderAchievements() {
+        const grid = $('ach-grid');
+        grid.innerHTML = '';
+        for (let i = 0; i < allAchievements.length; i++) {
+            const a = allAchievements[i];
+            const open = unlocked.indexOf(a.id) !== -1;
+            const item = el('div', 'ach-item ' + (open ? 'open' : 'locked'));
+            item.appendChild(el('div', 'ico', open ? a.icon : '🔒'));
+            item.appendChild(el('div', 'ttl', a.title));
+            item.appendChild(el('div', 'dsc', a.description));
+            grid.appendChild(item);
+        }
+        $('ach-count').textContent = unlocked.length + '/' + allAchievements.length;
+    }
+
+    // показывает новые достижения по одному всплывающим окном
+    function popAchievements(list) {
+        let i = 0;
+        function next() {
+            if (i >= list.length) {
+                return;
+            }
+            const a = list[i++];
+            $('ach-pop-icon').textContent = a.icon;
+            $('ach-pop-title').textContent = a.title;
+            const pop = $('ach-pop');
+            pop.classList.add('show');
+            achievementJingle();
+            setTimeout(() => {
+                pop.classList.remove('show');
+                setTimeout(next, 600);
+            }, 2600);
+        }
+        setTimeout(next, 1200);
+    }
+
     // ---------- кнопки ----------
     function spin() {
         if (spinning || functions.length === 0) {
             return;
         }
-        vscode.postMessage({ type: 'spin', minutes: minutes });
+        vscode.postMessage({ type: 'spin', minutes: minutes, difficulty: level });
     }
 
     $('spin').addEventListener('click', spin);
     $('hub').addEventListener('click', spin);
     $('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
     $('done').addEventListener('click', () => vscode.postMessage({ type: 'done' }));
+    $('hint').addEventListener('click', () => vscode.postMessage({ type: 'hint' }));
     $('giveup').addEventListener('click', () => vscode.postMessage({ type: 'giveUp' }));
     $('again').addEventListener('click', () => vscode.postMessage({ type: 'again' }));
+    $('report').addEventListener('click', () => vscode.postMessage({ type: 'openReport' }));
     $('original').addEventListener('click', () => vscode.postMessage({ type: 'showOriginal' }));
     $('restore').addEventListener('click', () => vscode.postMessage({ type: 'restore' }));
     $('sound').addEventListener('click', () => {
         soundOn = !soundOn;
         $('sound').textContent = soundOn ? '🔊' : '🔇';
     });
+    $('trophies').addEventListener('click', () => {
+        renderAchievements();
+        $('ach-modal').classList.remove('hidden');
+    });
+    $('ach-close').addEventListener('click', () => $('ach-modal').classList.add('hidden'));
+    $('ach-modal').addEventListener('click', (e) => {
+        if (e.target === $('ach-modal')) {
+            $('ach-modal').classList.add('hidden');
+        }
+    });
 
-    const segs = document.querySelectorAll('.seg');
-    for (let i = 0; i < segs.length; i++) {
-        segs[i].addEventListener('click', () => {
-            for (let k = 0; k < segs.length; k++) {
-                segs[k].classList.remove('active');
-            }
-            segs[i].classList.add('active');
-            minutes = Number(segs[i].dataset.min);
-            beep(500 + minutes * 40, 0.06, 'square', 0.04);
-        });
+    // группа кнопок-переключателей: активна одна, onPick получает выбранную кнопку
+    function segGroup(selector, onPick) {
+        const btns = document.querySelectorAll(selector);
+        for (let i = 0; i < btns.length; i++) {
+            btns[i].addEventListener('click', () => {
+                for (let k = 0; k < btns.length; k++) {
+                    btns[k].classList.remove('active');
+                }
+                btns[i].classList.add('active');
+                onPick(btns[i]);
+            });
+        }
     }
+
+    segGroup('.seg.tm', (b) => {
+        minutes = Number(b.dataset.min);
+        beep(500 + minutes * 40, 0.06, 'square', 0.04);
+    });
+    segGroup('.seg.lvl', (b) => {
+        level = b.dataset.level;
+        beep(level === 'hard' ? 220 : level === 'easy' ? 880 : 520, 0.08, 'square', 0.04);
+    });
 
     // мигание лампочек, пока колесо стоит
     setInterval(() => {
@@ -375,10 +487,15 @@
         switch (msg.type) {
             case 'init':
                 functions = msg.functions;
-                winner = -1;
+                winners = [];
                 $('file').textContent = msg.file || 'нет файла';
                 $('empty').classList.toggle('hidden', functions.length > 0);
                 setStats(msg.stats);
+                setExam(msg.exam);
+                if (msg.achievements) {
+                    allAchievements = msg.achievements.all;
+                    unlocked = msg.achievements.unlocked;
+                }
                 drawWheel();
                 if (msg.game) {
                     showSolving(msg.game);
@@ -390,13 +507,18 @@
             case 'spin':
                 functions = msg.functions;
                 drawWheel();
-                spinTo(msg.index);
+                spinAll(msg.indexes);
                 break;
             case 'solving':
                 showSolving(msg);
                 break;
             case 'tick':
                 setTimer(msg.left, msg.total);
+                break;
+            case 'hint':
+                addHint(msg.text);
+                toast('💡 Подсказка: −' + msg.penalty + ' секунд');
+                beep(1046, 0.12, 'triangle', 0.06);
                 break;
             case 'checking':
                 show('check');
@@ -407,17 +529,47 @@
             case 'cheat':
                 cheatAlarm(msg.penalty, msg.count);
                 break;
+            case 'notice':
+                toast(msg.text);
+                break;
             case 'restored':
                 $('restore').disabled = true;
-                toast('↩ Оригинал функции возвращён');
+                toast('↩ Оригинал возвращён');
                 break;
             case 'error':
                 toast('⚠ ' + msg.message);
-                setControlsEnabled(true);
-                spinning = false;
+                if (!spinning) {
+                    setControlsEnabled(true);
+                }
                 break;
         }
     });
+
+    function addHint(text) {
+        $('hints-box').classList.remove('hidden');
+        $('hints-list').appendChild(el('li', '', text));
+    }
+
+    function showSolving(g) {
+        const box = $('solve-names');
+        box.innerHTML = '';
+        for (let i = 0; i < g.names.length; i++) {
+            const block = el('div', 'fn-block');
+            block.appendChild(el('div', 'fn-name', g.names[i]));
+            block.appendChild(el('code', 'signature', g.signatures[i]));
+            box.appendChild(block);
+        }
+        $('solve-label').textContent = g.names.length > 1 ? 'ВЫПАЛИ ФУНКЦИИ' : 'ВЫПАЛА ФУНКЦИЯ';
+        $('solve-level').textContent = g.difficultyName || '';
+        $('hints-list').innerHTML = '';
+        $('hints-box').classList.toggle('hidden', !g.hints || g.hints.length === 0);
+        for (let i = 0; g.hints && i < g.hints.length; i++) {
+            $('hints-list').appendChild(el('li', '', g.hints[i]));
+        }
+        $('hint').classList.toggle('hidden', !g.hintsAllowed);
+        setTimer(g.left, g.total);
+        show('solve');
+    }
 
     // вспышка и тряска экрана, когда пойман на Ctrl+Z
     function cheatAlarm(penalty, count) {
@@ -429,13 +581,6 @@
         setTimeout(() => document.body.classList.remove('cheat'), 1800);
     }
 
-    function showSolving(g) {
-        $('solve-name').textContent = g.name;
-        $('solve-sig').textContent = g.signature;
-        setTimer(g.left, g.total);
-        show('solve');
-    }
-
     function showResult(r) {
         const title = $('result-title');
         title.textContent = r.win ? 'ПОБЕДА!' : 'ПОРАЖЕНИЕ';
@@ -443,6 +588,49 @@
         $('result-text').textContent = r.text;
         $('restore').disabled = !r.canRestore;
         setStats(r.stats);
+
+        // журнал раунда
+        const jl = $('journal-list');
+        jl.innerHTML = '';
+        const lines = r.journal && r.journal.length > 0 ? r.journal : ['✅ Чисто: без уходов, вставок и Ctrl+Z'];
+        for (let i = 0; i < lines.length; i++) {
+            jl.appendChild(el('li', '', lines[i]));
+        }
+        $('journal-box').classList.remove('hidden');
+        $('journal-box').classList.toggle('clean', !r.journal || r.journal.length === 0);
+
+        // новые достижения — значками на экране результата
+        const na = $('new-ach');
+        na.innerHTML = '';
+        const fresh = r.achievements || [];
+        for (let i = 0; i < fresh.length; i++) {
+            const b = el('div', 'badge');
+            b.style.animationDelay = (0.2 + i * 0.15) + 's';
+            b.appendChild(el('span', 'ico', fresh[i].icon));
+            b.appendChild(el('span', '', fresh[i].title));
+            na.appendChild(b);
+        }
+        na.classList.toggle('hidden', fresh.length === 0);
+        if (r.unlocked) {
+            unlocked = r.unlocked;
+        }
+
+        // экзамен: следующий раунд или итог и отчёт
+        const ex = r.exam;
+        $('exam-summary').classList.toggle('hidden', !ex || !ex.finished);
+        $('report').classList.toggle('hidden', !ex || !ex.finished);
+        $('again').classList.remove('hidden');
+        if (ex && !ex.finished) {
+            $('again-text').textContent = '▶ СЛЕДУЮЩИЙ РАУНД (' + (ex.round + 1) + '/' + ex.rounds + ')';
+            $('exam-round').textContent = 'РАУНД ' + ex.round + '/' + ex.rounds + ' ✓';
+        } else if (ex && ex.finished) {
+            $('exam-summary').textContent = '🎓 ЭКЗАМЕН ЗАВЕРШЁН: ' + ex.wins + ' из ' + ex.rounds +
+                ' раундов. Отчёт сохранён в папку проекта.';
+            $('again-text').textContent = '🎰 ИГРАТЬ ДАЛЬШЕ';
+        } else {
+            $('again-text').textContent = '🎰 ЕЩЁ РАЗ';
+        }
+
         show('result');
         if (r.win) {
             confetti();
@@ -450,6 +638,7 @@
         } else {
             sadTrombone();
         }
+        popAchievements(fresh);
     }
 
     // ---------- демо-режим для обычного браузера ----------
@@ -462,21 +651,36 @@
             { name: 'merge', signature: 'void merge(int* a, int l, int m, int r)', lines: 14 },
             { name: 'printArray', signature: 'void printArray(int* a, int n)', lines: 4 }
         ];
+        const ach = [
+            { id: 'first_win', icon: '🩸', title: 'Первая кровь', description: 'Первая победа' },
+            { id: 'lightning', icon: '⚡', title: 'Молния', description: 'Победа меньше чем за минуту' },
+            { id: 'hell', icon: '😈', title: 'Из ада', description: 'Победа на адском уровне' },
+            { id: 'busted', icon: '🚨', title: 'Пойман', description: 'Попался на Ctrl+Z' },
+            { id: 'exam', icon: '🎓', title: 'Экзамен сдан', description: 'Все раунды экзамена выиграны' }
+        ];
+        const exam = location.hash === '#exam'
+            ? { student: 'Иванов Иван, M3118', round: 1, rounds: 3, minutes: 5, difficultyName: '🔴 Адский', hintsAllowed: true }
+            : null;
         let stats = { wins: 3, losses: 1, streak: 2, bestSeconds: 142 };
         let timer = null;
-        let picked = 0;
+        let picked = [0];
+        let hints = 0;
         const send = (m) => setTimeout(() => window.dispatchEvent(new MessageEvent('message', { data: m })), 50);
         return {
             postMessage(m) {
                 if (m.type === 'ready' || m.type === 'refresh' || m.type === 'again') {
-                    send({ type: 'init', file: 'demo.cpp', functions: demo, stats: stats });
+                    send({ type: 'init', file: 'demo.cpp', functions: demo, stats: stats, exam: exam,
+                        achievements: { all: ach, unlocked: ['first_win'] } });
                 } else if (m.type === 'spin') {
-                    picked = Math.floor(Math.random() * demo.length);
-                    send({ type: 'spin', index: picked, functions: demo });
+                    const a = Math.floor(Math.random() * demo.length);
+                    picked = (m.difficulty === 'hard' || exam) ? [a, (a + 2) % demo.length] : [a];
+                    send({ type: 'spin', indexes: picked, functions: demo });
                 } else if (m.type === 'spinDone') {
-                    const total = m.minutes || 300;
+                    const total = 300;
                     let left = total;
-                    send({ type: 'solving', name: demo[picked].name, signature: demo[picked].signature, left: left, total: total });
+                    hints = 0;
+                    send({ type: 'solving', names: picked.map(i => demo[i].name), signatures: picked.map(i => demo[i].signature),
+                        left: left, total: total, hints: [], hintsAllowed: true, difficultyName: picked.length > 1 ? '🔴 Адский' : '🟡 Средний' });
                     timer = setInterval(() => {
                         left -= 15;
                         send({ type: 'tick', left: left, total: total });
@@ -484,6 +688,9 @@
                             clearInterval(timer);
                         }
                     }, 1000);
+                } else if (m.type === 'hint') {
+                    hints++;
+                    send({ type: 'hint', text: ['int pivot = a[r];', 'int i = l - 1;', 'for (int j = l; j < r; j++) {'][(hints - 1) % 3], penalty: 60 });
                 } else if (m.type === 'done' || m.type === 'giveUp') {
                     clearInterval(timer);
                     const win = m.type === 'done';
@@ -493,7 +700,11 @@
                                     : { wins: stats.wins, losses: stats.losses + 1, streak: 0, bestSeconds: stats.bestSeconds };
                         send({
                             type: 'result', win: win, stats: stats, canRestore: !win,
-                            text: win ? 'Функция partition написана за 01:35.\nТесты прошли ✔' : 'Ты сдался. Оригинал функции возвращён.'
+                            text: win ? 'Написано за 01:35: partition.\nПроверка пройдена ✔' : 'Ты сдался. Оригинал возвращён.',
+                            journal: win ? [] : ['🪟 Уходил из VS Code: 2 раз, всего 01:05', '📋 Большие вставки: 1 шт., 140 символов'],
+                            achievements: win ? [ach[1], ach[2]] : [ach[3]],
+                            unlocked: win ? ['first_win', 'lightning', 'hell'] : ['first_win', 'busted'],
+                            exam: exam ? { round: 3, rounds: 3, finished: true, wins: 2 } : null
                         });
                     }, win ? 1500 : 10);
                 } else if (m.type === 'restore') {

@@ -1,6 +1,7 @@
 /**
  * Точка входа плагина Code Roulette.
- * Класс RouletteController управляет игрой: панелью, редактором, таймером и проверкой.
+ * Класс RouletteController управляет игрой: панелью, редактором, таймером, проверкой,
+ * журналом, режимом экзамена и достижениями.
  */
 import * as vscode from 'vscode';
 import * as fs from 'fs';
@@ -9,29 +10,50 @@ import { exec } from 'child_process';
 import { findFunctions, indentAt, FunctionRange } from './parser';
 import { getPanelHtml } from './panel';
 import {
-    GameState, canTransition, pickIndex, pushRecent, formatTime,
+    GameState, canTransition, pushRecent, formatTime,
     Stats, emptyStats, updateStats, placeholderBody, looksLikeOriginal, CHEAT_PENALTY
 } from './game';
+import { JournalEvent, EventKind, makeEvent, isBigInsert, countChars, summarize, suspiciousLines, MIN_FOCUS_LOSS } from './journal';
+import {
+    Difficulty, DIFFICULTY_NAMES, pickTargets, hintLines, HINT_PENALTY,
+    ACHIEVEMENTS, newAchievements, Exam, createExam, checkPin, examFinished, examAllWon, buildReport
+} from './modes';
 
 /** Ключи для хранения данных между запусками VS Code. */
 const STATS_KEY = 'codeRoulette.stats';
 const RECENT_KEY = 'codeRoulette.recent';
+const ROUND_KEY = 'codeRoulette.round';
+const EXAM_KEY = 'codeRoulette.exam';
+const ACH_KEY = 'codeRoulette.achievements';
 
-/** Текущая игра: какую функцию стёрли и что нужно, чтобы её вернуть. */
-interface Round {
-    uri: vscode.Uri;
+/** Стёртая функция: что вернуть и как её найти. */
+interface Target {
     name: string;
     signature: string;
     /** Исходное тело функции (между `{` и `}`). */
     originalBody: string;
+    restored: boolean;
+}
+
+/**
+ * Текущий раунд. Хранится на диске (globalState), поэтому переживает закрытие VS Code:
+ * после перезапуска раунд продолжается, а время всё это время шло.
+ */
+interface Round {
+    uri: string;
+    targets: Target[];
     /** Сколько секунд дано. */
     total: number;
-    /** Время старта (мс). */
+    /** Время старта (мс). Штрафы сдвигают его назад. */
     startedAt: number;
-    /** Восстановлен ли уже оригинал. */
-    restored: boolean;
-    /** Сколько раз пытался вернуть оригинал (Ctrl+Z, вставка). */
+    difficulty: Difficulty;
     cheats: number;
+    hints: number;
+    events: JournalEvent[];
+    /** Когда плагин последний раз был жив (мс) — чтобы понять, сколько VS Code был закрыт. */
+    lastSeen: number;
+    /** Когда окно VS Code потеряло фокус (мс), 0 — окно в фокусе. */
+    focusLostAt: number;
 }
 
 class RouletteController {
@@ -39,10 +61,14 @@ class RouletteController {
     private state: GameState = 'idle';
     private uri: vscode.Uri | undefined;          // файл, с которым играем
     private candidates: FunctionRange[] = [];      // функции на колесе
-    private pending: FunctionRange | undefined;    // выпавшая, но ещё не стёртая
+    private pending: FunctionRange[] = [];         // выпавшие, но ещё не стёртые
     private pendingMinutes = 5;
+    private pendingDifficulty: Difficulty = 'medium';
     private round: Round | undefined;
+    private exam: Exam | undefined;
+    private lastReport: string | undefined;        // путь к последнему отчёту экзамена
     private timer: NodeJS.Timeout | undefined;
+    private ticks = 0;
     private readonly statusBar: vscode.StatusBarItem;
     private readonly output: vscode.OutputChannel;
     /** Плагин сам правит файл — такие правки не проверяем на читерство. */
@@ -52,13 +78,16 @@ class RouletteController {
         this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
         this.statusBar.command = 'codeRoulette.open';
         this.output = vscode.window.createOutputChannel('Code Roulette');
+        this.exam = context.globalState.get<Exam>(EXAM_KEY);
         this.resetStatusBar();
         this.statusBar.show();
         context.subscriptions.push(this.statusBar, this.output);
-        context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => this.watchForCheats(e)));
+        context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => this.watchEdits(e)));
+        context.subscriptions.push(vscode.window.onDidChangeWindowState(s => this.watchFocus(s.focused)));
+        this.resumeRound();
     }
 
-    // ---------- панель ----------
+    // ======================= панель =======================
 
     /** Открывает панель рулетки рядом с редактором (или показывает уже открытую). */
     open(): void {
@@ -92,7 +121,7 @@ class RouletteController {
     }
 
     /** Обработка нажатий кнопок в панели. */
-    private async onMessage(msg: { type: string; minutes?: number }): Promise<void> {
+    private async onMessage(msg: { type: string; minutes?: number; difficulty?: Difficulty }): Promise<void> {
         switch (msg.type) {
             case 'ready':
             case 'refresh':
@@ -100,7 +129,7 @@ class RouletteController {
                 this.sendInit();
                 break;
             case 'spin':
-                await this.spin(msg.minutes || 5);
+                await this.spin(msg.minutes || 5, msg.difficulty || 'medium');
                 break;
             case 'spinDone':
                 await this.startRound();
@@ -111,6 +140,9 @@ class RouletteController {
             case 'giveUp':
                 await this.giveUp();
                 break;
+            case 'hint':
+                this.giveHint();
+                break;
             case 'showOriginal':
                 await this.showOriginal();
                 break;
@@ -118,6 +150,9 @@ class RouletteController {
                 if (await this.restoreOriginal()) {
                     this.post({ type: 'restored' });
                 }
+                break;
+            case 'openReport':
+                this.openReport();
                 break;
             case 'again':
                 if (canTransition(this.state, 'idle')) {
@@ -140,7 +175,24 @@ class RouletteController {
         }
     }
 
-    /** Отправляет в панель список функций, статистику и текущую игру (если идёт). */
+    /** Данные экзамена для панели (или null, если экзамена нет). */
+    private examInfo(): object | null {
+        if (this.exam === undefined) {
+            return null;
+        }
+        const c = this.exam.config;
+        return {
+            student: c.student,
+            round: Math.min(this.exam.results.length + 1, c.rounds),
+            rounds: c.rounds,
+            minutes: c.minutes,
+            difficulty: c.difficulty,
+            difficultyName: DIFFICULTY_NAMES[c.difficulty],
+            hintsAllowed: c.hintsAllowed
+        };
+    }
+
+    /** Отправляет в панель список функций, статистику, экзамен и текущую игру (если идёт). */
     private async sendInit(): Promise<void> {
         let fileName = '';
         this.candidates = [];
@@ -149,20 +201,38 @@ class RouletteController {
             fileName = path.basename(this.uri.fsPath);
             this.candidates = this.filterCandidates(findFunctions(doc.getText()));
         }
-        let game = undefined;
+        let game = null;
         if (this.state === 'solving' && this.round !== undefined) {
-            game = {
-                name: this.round.name, signature: this.round.signature,
-                left: this.secondsLeft(), total: this.round.total
-            };
+            game = this.solvingInfo();
         }
         this.post({
             type: 'init',
             file: fileName,
-            functions: this.candidates.map(f => ({ name: f.name, signature: f.signature, lines: f.bodyLines })),
+            functions: this.wheelItems(),
             stats: this.getStats(),
-            game: game
+            game: game,
+            exam: this.examInfo(),
+            achievements: { all: ACHIEVEMENTS, unlocked: this.getUnlocked() }
         });
+    }
+
+    /** Секторы колеса: имя, заголовок, длина. */
+    private wheelItems(): object[] {
+        return this.candidates.map(f => ({ name: f.name, signature: f.signature, lines: f.bodyLines }));
+    }
+
+    /** Всё о текущем раунде для экрана решения. */
+    private solvingInfo(): object {
+        const r = this.round!;
+        return {
+            names: r.targets.map(t => t.name),
+            signatures: r.targets.map(t => t.signature),
+            left: this.secondsLeft(),
+            total: r.total,
+            hints: this.allHints().slice(0, r.hints),
+            hintsAllowed: this.hintsAllowed(),
+            difficultyName: DIFFICULTY_NAMES[r.difficulty]
+        };
     }
 
     /** Оставляет только функции, подходящие для игры (по настройкам). */
@@ -173,10 +243,10 @@ class RouletteController {
         return all.filter(f => !(skipMain && f.name === 'main') && f.bodyLines >= minLines);
     }
 
-    // ---------- ход игры ----------
+    // ======================= ход игры =======================
 
-    /** Кнопка «Крутить»: выбираем функцию и просим панель прокрутить колесо до неё. */
-    private async spin(minutes: number): Promise<void> {
+    /** Кнопка «Крутить»: выбираем функции и просим панель прокрутить колесо до них. */
+    private async spin(minutes: number, difficulty: Difficulty): Promise<void> {
         if (!canTransition(this.state, 'spinning')) {
             return;
         }
@@ -184,70 +254,111 @@ class RouletteController {
             this.post({ type: 'error', message: 'Открой C/C++ файл и нажми «Обновить»' });
             return;
         }
+        // на экзамене время и сложность задаёт практик, а не кнопки на панели
+        if (this.exam !== undefined) {
+            minutes = this.exam.config.minutes;
+            difficulty = this.exam.config.difficulty;
+        }
         const doc = await vscode.workspace.openTextDocument(this.uri);
         this.candidates = this.filterCandidates(findFunctions(doc.getText()));
-        const names = this.candidates.map(f => f.name);
-        const index = pickIndex(names, this.getRecent());
-        if (index === -1) {
+        const items = this.candidates.map(f => ({ name: f.name, lines: f.bodyLines }));
+        const indexes = pickTargets(items, difficulty, this.getRecent());
+        if (indexes.length === 0) {
             this.post({ type: 'error', message: 'В файле нет подходящих функций' });
             return;
         }
         this.state = 'spinning';
-        this.pending = this.candidates[index];
+        this.pending = indexes.map(i => this.candidates[i]);
         this.pendingMinutes = minutes;
-        this.post({
-            type: 'spin',
-            index: index,
-            functions: this.candidates.map(f => ({ name: f.name, signature: f.signature, lines: f.bodyLines }))
-        });
+        this.pendingDifficulty = difficulty;
+        this.post({ type: 'spin', indexes: indexes, functions: this.wheelItems() });
     }
 
-    /** Колесо остановилось: стираем тело функции, сохраняем оригинал, запускаем таймер. */
+    /** Колесо остановилось: стираем тела функций, сохраняем оригиналы, запускаем таймер. */
     private async startRound(): Promise<void> {
-        if (this.state !== 'spinning' || this.pending === undefined || this.uri === undefined) {
+        if (this.state !== 'spinning' || this.pending.length === 0 || this.uri === undefined) {
             return;
         }
         const doc = await vscode.workspace.openTextDocument(this.uri);
         const text = doc.getText();
-        // ищем функцию заново: пока крутилось колесо, файл могли изменить
-        const fresh = findFunctions(text).find(f => f.signature === this.pending!.signature);
-        if (fresh === undefined) {
-            this.state = 'idle';
-            this.post({ type: 'error', message: 'Функция изменилась, крутим заново' });
-            this.sendInit();
-            return;
+        // ищем функции заново: пока крутилось колесо, файл могли изменить
+        const all = findFunctions(text);
+        const fresh: FunctionRange[] = [];
+        for (let i = 0; i < this.pending.length; i++) {
+            const f = all.find(x => x.signature === this.pending[i].signature);
+            if (f === undefined) {
+                this.state = 'idle';
+                this.post({ type: 'error', message: 'Функция изменилась, крутим заново' });
+                this.sendInit();
+                return;
+            }
+            fresh.push(f);
         }
-        const originalBody = text.slice(fresh.open + 1, fresh.close);
-        this.saveBackup(fresh.signature, originalBody);
 
+        const targets: Target[] = [];
         const edit = new vscode.WorkspaceEdit();
-        const range = new vscode.Range(doc.positionAt(fresh.open + 1), doc.positionAt(fresh.close));
-        edit.replace(this.uri, range, placeholderBody(indentAt(text, fresh.headerStart)));
+        for (let i = 0; i < fresh.length; i++) {
+            const f = fresh[i];
+            const body = text.slice(f.open + 1, f.close);
+            targets.push({ name: f.name, signature: f.signature, originalBody: body, restored: false });
+            const range = new vscode.Range(doc.positionAt(f.open + 1), doc.positionAt(f.close));
+            edit.replace(this.uri, range, placeholderBody(indentAt(text, f.headerStart)));
+        }
+        this.saveBackup(targets);
         await this.applyOwnEdit(edit);
         await doc.save();
 
-        // переводим курсор на строку с TODO
-        const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
-        const todoLine = doc.positionAt(fresh.open).line + 1;
-        const end = doc.lineAt(todoLine).range.end;
-        editor.selection = new vscode.Selection(end, end);
-        editor.revealRange(new vscode.Range(end, end), vscode.TextEditorRevealType.InCenter);
-
         this.round = {
-            uri: this.uri,
-            name: fresh.name,
-            signature: fresh.signature,
-            originalBody: originalBody,
+            uri: this.uri.toString(),
+            targets: targets,
             total: this.pendingMinutes * 60,
             startedAt: Date.now(),
-            restored: false,
-            cheats: 0
+            difficulty: this.pendingDifficulty,
+            cheats: 0,
+            hints: 0,
+            events: [],
+            lastSeen: Date.now(),
+            focusLostAt: 0
         };
-        this.pending = undefined;
+        this.pending = [];
         this.state = 'solving';
-        this.setRecent(pushRecent(this.getRecent(), fresh.name));
-        this.post({ type: 'solving', name: fresh.name, signature: fresh.signature, left: this.round.total, total: this.round.total });
+        let recent = this.getRecent();
+        for (let i = 0; i < targets.length; i++) {
+            recent = pushRecent(recent, targets[i].name);
+        }
+        this.setRecent(recent);
+        this.addEvent('start', 0, targets.map(t => t.name).join(', ') + ' · ' + DIFFICULTY_NAMES[this.round.difficulty]);
+
+        await this.revealTarget(0);
+        this.post({ type: 'solving', ...this.solvingInfo() });
         this.startTimer();
+    }
+
+    /** Переводит курсор на строку с TODO в стёртой функции. */
+    private async revealTarget(index: number): Promise<void> {
+        if (this.round === undefined) {
+            return;
+        }
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(this.round.uri));
+        const f = this.findTarget(doc.getText(), this.round.targets[index]);
+        if (f === undefined) {
+            return;
+        }
+        const editor = await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        const line = Math.min(doc.positionAt(f.open).line + 1, doc.lineCount - 1);
+        const end = doc.lineAt(line).range.end;
+        editor.selection = new vscode.Selection(end, end);
+        editor.revealRange(new vscode.Range(end, end), vscode.TextEditorRevealType.InCenter);
+    }
+
+    /** Ищет стёртую функцию в текущем тексте: по заголовку, а если его поменяли — по имени. */
+    private findTarget(text: string, t: Target): FunctionRange | undefined {
+        const all = findFunctions(text);
+        let f = all.find(x => x.signature === t.signature);
+        if (f === undefined) {
+            f = all.find(x => x.name === t.name);
+        }
+        return f;
     }
 
     /** Сколько секунд осталось в текущем раунде. */
@@ -280,22 +391,37 @@ class RouletteController {
         }
     }
 
-    /** Каждую секунду: обновляем таймер в панели и строке состояния, проверяем конец времени. */
+    /** Каждую секунду: таймер в панели и строке состояния, «пульс» на диск, конец времени. */
     private onTick(): void {
-        if (this.round === undefined) {
+        if (this.round === undefined || this.state !== 'solving') {
             return;
         }
         const left = this.secondsLeft();
         this.post({ type: 'tick', left: left, total: this.round.total });
-        this.statusBar.text = '🎰 ' + formatTime(left) + ' · ' + this.round.name;
-        this.statusBar.tooltip = 'Code Roulette: напиши функцию ' + this.round.signature;
+        const names = this.round.targets.map(t => t.name).join(' + ');
+        this.statusBar.text = '🎰 ' + formatTime(left) + ' · ' + names;
+        this.statusBar.tooltip = 'Code Roulette: напиши ' + this.round.targets.map(t => t.signature).join(' и ');
         this.statusBar.backgroundColor = left <= 60
             ? new vscode.ThemeColor('statusBarItem.errorBackground')
             : new vscode.ThemeColor('statusBarItem.warningBackground');
-        if (left <= 0) {
-            this.finish(false, '⏰ Время вышло!\nФункцию ' + this.round.name + ' нужно было написать за ' +
-                formatTime(this.round.total) + '.');
+
+        // раз в 5 секунд отмечаем «я жив» — по этой отметке узнаем, сколько VS Code был закрыт
+        this.ticks++;
+        this.round.lastSeen = Date.now();
+        if (this.ticks % 5 === 0) {
+            this.saveRound();
         }
+        if (left <= 0) {
+            this.finish(false, '⏰ Время вышло!\nНужно было успеть за ' + formatTime(this.round.total) + '.');
+        }
+    }
+
+    /** Команда проверки: на экзамене — зафиксированная практиком, иначе — из настроек. */
+    private checkCommand(): string {
+        if (this.exam !== undefined) {
+            return this.exam.config.checkCommand;
+        }
+        return vscode.workspace.getConfiguration('codeRoulette').get<string>('checkCommand', '').trim();
     }
 
     /** Кнопка «Готово»: сохраняем файл и запускаем проверку. */
@@ -306,28 +432,28 @@ class RouletteController {
         this.stopTimer();
         this.state = 'checking';
         const seconds = this.secondsPassed();
-        const doc = await vscode.workspace.openTextDocument(this.round.uri);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(this.round.uri));
         await doc.save();
+        const names = this.round.targets.map(t => t.name).join(' и ');
 
-        const command = vscode.workspace.getConfiguration('codeRoulette').get<string>('checkCommand', '').trim();
+        const command = this.checkCommand();
         if (command === '') {
-            this.finish(true, 'Функция ' + this.round.name + ' написана за ' + formatTime(seconds) +
+            this.finish(true, 'Написано за ' + formatTime(seconds) + ': ' + names +
                 '.\nКоманда проверки не задана — засчитано по времени.', seconds);
             return;
         }
         this.post({ type: 'checking' });
-        const cwd = this.projectFolder(this.round.uri);
+        const cwd = this.projectFolder(vscode.Uri.parse(this.round.uri));
         const result = await runCommand(command, cwd);
         this.output.clear();
         this.output.appendLine('$ ' + command + '   (папка: ' + cwd + ')');
         this.output.appendLine(result.output);
         this.output.appendLine(result.ok ? '✔ Проверка пройдена' : '✘ Проверка не пройдена');
         if (result.ok) {
-            this.finish(true, 'Функция ' + this.round.name + ' написана за ' + formatTime(seconds) +
-                '.\nПроверка пройдена ✔', seconds);
+            this.finish(true, 'Написано за ' + formatTime(seconds) + ': ' + names + '.\nПроверка пройдена ✔', seconds);
         } else {
             this.output.show(true);
-            this.finish(false, 'Проверка не пройдена ✘\nПодробности — в панели Output → Code Roulette.');
+            this.finish(false, 'Проверка не пройдена ✘\nПодробности — в панели Output → Code Roulette.', seconds);
         }
     }
 
@@ -338,32 +464,141 @@ class RouletteController {
         }
         this.stopTimer();
         await this.restoreOriginal();
-        this.finish(false, 'Ты сдался. Оригинал функции ' + this.round.name + ' возвращён.');
+        this.finish(false, 'Ты сдался. Оригинал возвращён.', this.secondsPassed());
     }
 
-    /** Завершает раунд: обновляет статистику и показывает результат. */
+    /**
+     * Завершает раунд: статистика, журнал, достижения, экзамен и экран результата.
+     */
     private finish(win: boolean, text: string, seconds = 0): void {
-        if (!canTransition(this.state, 'finished')) {
+        if (this.round === undefined || !canTransition(this.state, 'finished')) {
             return;
         }
         this.stopTimer();
         this.state = 'finished';
+        const r = this.round;
+        const left = this.secondsLeft();
+        this.addEvent('finish', 0, (win ? 'Победа. ' : 'Поражение. ') + text.split('\n')[0]);
+        this.context.globalState.update(ROUND_KEY, undefined); // раунд закончен — не продолжать после перезапуска
+
         const stats = updateStats(this.getStats(), win, seconds);
         this.context.globalState.update(STATS_KEY, stats);
         this.resetStatusBar();
-        if (this.round !== undefined && this.round.cheats > 0) {
-            text += '\n🚫 Попыток вернуть оригинал: ' + this.round.cheats + ' (−' +
-                this.round.cheats * CHEAT_PENALTY + ' сек)';
+        if (r.cheats > 0) {
+            text += '\n🚫 Штраф за попытки вернуть оригинал: −' + r.cheats * CHEAT_PENALTY + ' сек';
         }
-        const canRestore = this.round !== undefined && !this.round.restored;
-        this.post({ type: 'result', win: win, text: text, stats: stats, canRestore: canRestore });
+
+        // экзамен: записываем раунд, а после последнего — отчёт
+        let examResult = null;
+        let examPassed = false;
+        if (this.exam !== undefined) {
+            this.exam.results.push({
+                functions: r.targets.map(t => t.name), win: win, seconds: seconds,
+                total: r.total, text: text, events: r.events
+            });
+            const done = examFinished(this.exam);
+            examPassed = done && examAllWon(this.exam);
+            examResult = {
+                round: this.exam.results.length,
+                rounds: this.exam.config.rounds,
+                finished: done,
+                wins: this.exam.results.filter(x => x.win).length
+            };
+            if (done) {
+                this.writeReport(false);
+            } else {
+                this.context.globalState.update(EXAM_KEY, this.exam);
+            }
+        }
+
+        // достижения
+        const unlocked = this.getUnlocked();
+        const fresh = newAchievements({
+            win: win, seconds: seconds, secondsLeft: left, hints: r.hints, cheats: r.cheats,
+            difficulty: r.difficulty, stats: stats, examPassed: examPassed
+        }, unlocked);
+        this.context.globalState.update(ACH_KEY, unlocked.concat(fresh.map(a => a.id)));
+
+        const canRestore = r.targets.some(t => !t.restored);
+        this.post({
+            type: 'result', win: win, text: text, stats: stats, canRestore: canRestore,
+            journal: suspiciousLines(summarize(r.events)),
+            achievements: fresh,
+            unlocked: this.getUnlocked(),
+            exam: examResult
+        });
         if (this.panel === undefined) {
-            // панель закрыта — сообщаем всплывающим уведомлением
             vscode.window.showInformationMessage((win ? '🎉 Победа! ' : '💀 Поражение. ') + text.split('\n')[0]);
         }
     }
 
-    // ---------- защита от читерства ----------
+    // ======================= журнал и защита =======================
+
+    /** Добавляет событие в журнал раунда и сохраняет раунд на диск. */
+    private addEvent(kind: EventKind, value: number, text: string): void {
+        if (this.round === undefined) {
+            return;
+        }
+        this.round.events.push(makeEvent(this.secondsPassed(), kind, value, text));
+        this.saveRound();
+    }
+
+    /** Сохраняет текущий раунд, чтобы он пережил закрытие VS Code. */
+    private saveRound(): void {
+        if (this.round !== undefined && (this.state === 'solving' || this.state === 'checking')) {
+            this.context.globalState.update(ROUND_KEY, this.round);
+        }
+    }
+
+    /**
+     * При запуске VS Code: если на диске есть незаконченный раунд — продолжаем его.
+     * Время шло, пока VS Code был закрыт; в журнал пишется, на сколько его закрывали.
+     */
+    private resumeRound(): void {
+        const saved = this.context.globalState.get<Round>(ROUND_KEY);
+        if (saved === undefined) {
+            return;
+        }
+        this.round = saved;
+        this.uri = vscode.Uri.parse(saved.uri);
+        this.state = 'solving';
+        const closed = Math.floor((Date.now() - saved.lastSeen) / 1000);
+        if (saved.focusLostAt > 0) {
+            saved.focusLostAt = 0;
+        }
+        if (closed >= MIN_FOCUS_LOSS) {
+            this.addEvent('closed', closed, '');
+        }
+        if (this.secondsLeft() <= 0) {
+            this.finish(false, '⏰ Время вышло, пока VS Code был закрыт.');
+            vscode.window.showWarningMessage('🎰 Code Roulette: время раунда вышло, пока VS Code был закрыт. Засчитано поражение.');
+            return;
+        }
+        this.startTimer();
+        vscode.window.showWarningMessage('🎰 Code Roulette: раунд продолжается! VS Code был закрыт ' +
+            formatTime(closed) + ' — таймер всё это время шёл.');
+        this.open();
+    }
+
+    /** Окно VS Code потеряло или получило фокус (ушёл в браузер, мессенджер и т.п.). */
+    private watchFocus(focused: boolean): void {
+        if (this.round === undefined || this.state !== 'solving') {
+            return;
+        }
+        if (!focused) {
+            this.round.focusLostAt = Date.now();
+            this.saveRound();
+            return;
+        }
+        if (this.round.focusLostAt > 0) {
+            const away = Math.floor((Date.now() - this.round.focusLostAt) / 1000);
+            this.round.focusLostAt = 0;
+            if (away >= MIN_FOCUS_LOSS) {
+                this.addEvent('focus', away, '');
+                this.post({ type: 'notice', text: '🪟 Ты уходил из VS Code на ' + formatTime(away) + ' — это записано в журнал' });
+            }
+        }
+    }
 
     /** Применяет правку плагина так, чтобы она не считалась читерством. */
     private async applyOwnEdit(edit: vscode.WorkspaceEdit): Promise<void> {
@@ -376,90 +611,296 @@ class RouletteController {
     }
 
     /**
-     * Следит за правками в файле во время раунда. Если одной правкой вернулся большой
-     * кусок оригинала (Ctrl+Z, вставка из буфера, откат файла) — стираем тело снова
-     * и вычитаем CHEAT_PENALTY секунд.
+     * Следит за правками в файле во время раунда:
+     * - вернулся кусок оригинала (Ctrl+Z, вставка, откат файла) — чит: стираем снова и штрафуем;
+     * - просто большая вставка — записываем в журнал.
      */
-    private watchForCheats(e: vscode.TextDocumentChangeEvent): void {
+    private watchEdits(e: vscode.TextDocumentChangeEvent): void {
         if (this.ownEdit || this.state !== 'solving' || this.round === undefined) {
             return;
         }
-        if (e.document.uri.toString() !== this.round.uri.toString()) {
+        if (e.document.uri.toString() !== this.round.uri) {
             return;
         }
         for (let i = 0; i < e.contentChanges.length; i++) {
-            if (looksLikeOriginal(e.contentChanges[i].text, this.round.originalBody)) {
-                // править документ прямо внутри события нельзя — откладываем
-                setTimeout(() => this.punishCheat(), 0);
-                return;
+            const inserted = e.contentChanges[i].text;
+            for (let k = 0; k < this.round.targets.length; k++) {
+                if (looksLikeOriginal(inserted, this.round.targets[k].originalBody)) {
+                    // править документ прямо внутри события нельзя — откладываем
+                    setTimeout(() => this.punishCheat(k), 0);
+                    return;
+                }
+            }
+            if (isBigInsert(inserted)) {
+                this.addEvent('paste', countChars(inserted), '');
             }
         }
     }
 
     /** Наказание за чит: снова стираем тело функции и забираем время. */
-    private async punishCheat(): Promise<void> {
+    private async punishCheat(index: number): Promise<void> {
         if (this.round === undefined || this.state !== 'solving') {
             return;
         }
-        const doc = await vscode.workspace.openTextDocument(this.round.uri);
+        const t = this.round.targets[index];
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(this.round.uri));
         const text = doc.getText();
-        const all = findFunctions(text);
-        let target = all.find(f => f.signature === this.round!.signature);
-        if (target === undefined) {
-            target = all.find(f => f.name === this.round!.name);
-        }
-        if (target !== undefined) {
+        const f = this.findTarget(text, t);
+        if (f !== undefined) {
             const edit = new vscode.WorkspaceEdit();
-            const range = new vscode.Range(doc.positionAt(target.open + 1), doc.positionAt(target.close));
-            edit.replace(this.round.uri, range, placeholderBody(indentAt(text, target.headerStart)));
+            const range = new vscode.Range(doc.positionAt(f.open + 1), doc.positionAt(f.close));
+            edit.replace(doc.uri, range, placeholderBody(indentAt(text, f.headerStart)));
             await this.applyOwnEdit(edit);
         }
         this.round.cheats++;
         this.round.startedAt -= CHEAT_PENALTY * 1000;
+        this.addEvent('cheat', 0, t.name);
         this.post({ type: 'cheat', penalty: CHEAT_PENALTY, count: this.round.cheats });
         vscode.window.showWarningMessage('🚫 Code Roulette: вернуть оригинал через Ctrl+Z или вставку нельзя! −' +
             CHEAT_PENALTY + ' секунд.');
         this.onTick();
     }
 
-    // ---------- оригинал функции ----------
+    // ======================= подсказки =======================
 
-    /** Возвращает исходное тело функции в файл. */
+    /** Разрешены ли подсказки: вне экзамена всегда, на экзамене — как решил практик. */
+    private hintsAllowed(): boolean {
+        return this.exam === undefined || this.exam.config.hintsAllowed;
+    }
+
+    /** Все строки-подсказки по порядку: сначала первой функции, потом второй. */
+    private allHints(): string[] {
+        if (this.round === undefined) {
+            return [];
+        }
+        const res: string[] = [];
+        for (let i = 0; i < this.round.targets.length; i++) {
+            const t = this.round.targets[i];
+            const lines = hintLines(t.originalBody);
+            for (let k = 0; k < lines.length; k++) {
+                res.push((this.round.targets.length > 1 ? t.name + ': ' : '') + lines[k]);
+            }
+        }
+        return res;
+    }
+
+    /** Кнопка «Подсказка»: показывает следующую строку оригинала за −60 секунд. */
+    private giveHint(): void {
+        if (this.round === undefined || this.state !== 'solving') {
+            return;
+        }
+        if (!this.hintsAllowed()) {
+            this.post({ type: 'error', message: 'На этом экзамене подсказки запрещены' });
+            return;
+        }
+        const all = this.allHints();
+        if (this.round.hints >= all.length) {
+            this.post({ type: 'error', message: 'Подсказки закончились — дальше сам!' });
+            return;
+        }
+        const line = all[this.round.hints];
+        this.round.hints++;
+        this.round.startedAt -= HINT_PENALTY * 1000;
+        this.addEvent('hint', this.round.hints, line);
+        this.post({ type: 'hint', text: line, penalty: HINT_PENALTY });
+        this.onTick();
+    }
+
+    // ======================= экзамен =======================
+
+    /** Команда практика: настроить и начать экзамен. */
+    async startExam(): Promise<void> {
+        if (this.state === 'solving' || this.state === 'checking' || this.state === 'spinning') {
+            vscode.window.showErrorMessage('Code Roulette: сначала закончи текущий раунд');
+            return;
+        }
+        if (this.exam !== undefined) {
+            vscode.window.showErrorMessage('Code Roulette: экзамен уже идёт. Остановить — командой «Остановить экзамен» (нужен PIN)');
+            return;
+        }
+        const student = await vscode.window.showInputBox({
+            title: 'Экзамен · 1/6', prompt: 'ФИО и группа студента', placeHolder: 'Иванов Иван, M3118',
+            ignoreFocusOut: true, validateInput: v => v.trim() === '' ? 'Введите ФИО' : undefined
+        });
+        if (student === undefined) {
+            return;
+        }
+        const rounds = await vscode.window.showQuickPick(['1', '2', '3', '4', '5'], {
+            title: 'Экзамен · 2/6', placeHolder: 'Сколько раундов?', ignoreFocusOut: true
+        });
+        if (rounds === undefined) {
+            return;
+        }
+        const minutes = await vscode.window.showQuickPick(['3', '5', '10', '15'], {
+            title: 'Экзамен · 3/6', placeHolder: 'Минут на раунд?', ignoreFocusOut: true
+        });
+        if (minutes === undefined) {
+            return;
+        }
+        const levels: { label: string; value: Difficulty }[] = [
+            { label: DIFFICULTY_NAMES.easy + ' — короткие функции', value: 'easy' },
+            { label: DIFFICULTY_NAMES.medium + ' — любые функции', value: 'medium' },
+            { label: DIFFICULTY_NAMES.hard + ' — длинные функции, две за раунд', value: 'hard' }
+        ];
+        const level = await vscode.window.showQuickPick(levels, {
+            title: 'Экзамен · 4/6', placeHolder: 'Сложность', ignoreFocusOut: true
+        });
+        if (level === undefined) {
+            return;
+        }
+        const hints = await vscode.window.showQuickPick(['Запретить подсказки', 'Разрешить подсказки (−60 сек)'], {
+            title: 'Экзамен · 5/6', placeHolder: 'Подсказки', ignoreFocusOut: true
+        });
+        if (hints === undefined) {
+            return;
+        }
+        const command = await vscode.window.showInputBox({
+            title: 'Экзамен · 6/6', prompt: 'Команда проверки (пусто — победа по времени). Студент не сможет её поменять.',
+            value: vscode.workspace.getConfiguration('codeRoulette').get<string>('checkCommand', ''),
+            ignoreFocusOut: true
+        });
+        if (command === undefined) {
+            return;
+        }
+        const pin = await vscode.window.showInputBox({
+            title: 'PIN практика', prompt: 'Придумайте PIN (от 4 символов): он нужен, чтобы остановить экзамен',
+            password: true, ignoreFocusOut: true,
+            validateInput: v => v.length < 4 ? 'Минимум 4 символа' : undefined
+        });
+        if (pin === undefined) {
+            return;
+        }
+        const pin2 = await vscode.window.showInputBox({
+            title: 'PIN практика', prompt: 'Повторите PIN', password: true, ignoreFocusOut: true
+        });
+        if (pin2 !== pin) {
+            vscode.window.showErrorMessage('Code Roulette: PIN не совпал, экзамен не начат');
+            return;
+        }
+        this.exam = createExam({
+            student: student.trim(), rounds: Number(rounds), minutes: Number(minutes),
+            difficulty: level.value, hintsAllowed: hints.startsWith('Разрешить'),
+            checkCommand: command.trim(), pin: pin
+        });
+        this.context.globalState.update(EXAM_KEY, this.exam);
+        this.state = 'idle';
+        this.open();
+        this.sendInit();
+        vscode.window.showInformationMessage('🎓 Экзамен начат: ' + rounds + ' раунд(ов) по ' + minutes +
+            ' мин. Передайте компьютер студенту.');
+    }
+
+    /** Команда практика: досрочно остановить экзамен (нужен PIN). */
+    async stopExam(): Promise<void> {
+        if (this.exam === undefined) {
+            vscode.window.showInformationMessage('Code Roulette: экзамен не идёт');
+            return;
+        }
+        const pin = await vscode.window.showInputBox({
+            title: 'Остановить экзамен', prompt: 'PIN практика', password: true, ignoreFocusOut: true
+        });
+        if (pin === undefined) {
+            return;
+        }
+        if (!checkPin(this.exam, pin)) {
+            vscode.window.showErrorMessage('Code Roulette: неверный PIN');
+            if (this.round !== undefined && this.state === 'solving') {
+                this.addEvent('finish', 0, 'Попытка остановить экзамен с неверным PIN');
+            }
+            return;
+        }
+        if (this.round !== undefined && (this.state === 'solving' || this.state === 'checking')) {
+            this.stopTimer();
+            await this.restoreOriginal();
+            this.exam.results.push({
+                functions: this.round.targets.map(t => t.name), win: false, seconds: this.secondsPassed(),
+                total: this.round.total, text: 'Остановлен практиком', events: this.round.events
+            });
+            this.context.globalState.update(ROUND_KEY, undefined);
+            this.resetStatusBar();
+        }
+        this.writeReport(true);
+        this.state = 'idle';
+        this.sendInit();
+    }
+
+    /** Сохраняет отчёт экзамена в папку проекта, открывает его и заканчивает экзамен. */
+    private writeReport(interrupted: boolean): void {
+        if (this.exam === undefined) {
+            return;
+        }
+        const uri = this.uri !== undefined ? this.uri : (this.round !== undefined ? vscode.Uri.parse(this.round.uri) : undefined);
+        const folder = uri !== undefined ? this.projectFolder(uri) : this.context.globalStorageUri.fsPath;
+        const d = new Date();
+        const two = (n: number) => (n < 10 ? '0' : '') + n;
+        const stamp = d.getFullYear() + two(d.getMonth() + 1) + two(d.getDate()) + '-' + two(d.getHours()) + two(d.getMinutes());
+        const file = path.join(folder, 'roulette-report-' + stamp + '.md');
+        try {
+            fs.mkdirSync(folder, { recursive: true });
+            fs.writeFileSync(file, buildReport(this.exam, uri !== undefined ? path.basename(uri.fsPath) : '—', interrupted), 'utf8');
+            this.lastReport = file;
+        } catch (e) {
+            vscode.window.showErrorMessage('Code Roulette: не удалось сохранить отчёт: ' + String(e));
+        }
+        this.exam = undefined;
+        this.context.globalState.update(EXAM_KEY, undefined);
+        this.openReport();
+    }
+
+    /** Открывает последний отчёт экзамена в режиме просмотра Markdown. */
+    private openReport(): void {
+        if (this.lastReport === undefined) {
+            return;
+        }
+        vscode.commands.executeCommand('markdown.showPreview', vscode.Uri.file(this.lastReport));
+    }
+
+    // ======================= оригинал функции =======================
+
+    /** Возвращает исходные тела стёртых функций в файл. */
     async restoreOriginal(): Promise<boolean> {
-        if (this.round === undefined || this.round.restored) {
+        if (this.round === undefined) {
             return false;
         }
-        const doc = await vscode.workspace.openTextDocument(this.round.uri);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(this.round.uri));
         const text = doc.getText();
-        const all = findFunctions(text);
-        let target = all.find(f => f.signature === this.round!.signature);
-        if (target === undefined) {
-            target = all.find(f => f.name === this.round!.name);
+        const edit = new vscode.WorkspaceEdit();
+        let changed = false;
+        for (let i = 0; i < this.round.targets.length; i++) {
+            const t = this.round.targets[i];
+            if (t.restored) {
+                continue;
+            }
+            const f = this.findTarget(text, t);
+            if (f === undefined) {
+                vscode.window.showErrorMessage('Code Roulette: не нашёл функцию ' + t.name +
+                    '. Оригинал сохранён в резервной копии: ' + this.backupPath());
+                continue;
+            }
+            const range = new vscode.Range(doc.positionAt(f.open + 1), doc.positionAt(f.close));
+            edit.replace(doc.uri, range, t.originalBody);
+            t.restored = true;
+            changed = true;
         }
-        if (target === undefined) {
-            vscode.window.showErrorMessage('Code Roulette: не нашёл функцию ' + this.round.name +
-                '. Оригинал сохранён в резервной копии: ' + this.backupPath());
+        if (!changed) {
             return false;
         }
-        const edit = new vscode.WorkspaceEdit();
-        const range = new vscode.Range(doc.positionAt(target.open + 1), doc.positionAt(target.close));
-        edit.replace(this.round.uri, range, this.round.originalBody);
         await this.applyOwnEdit(edit);
         await doc.save();
-        this.round.restored = true;
         return true;
     }
 
-    /** Открывает оригинал функции в отдельной вкладке. */
+    /** Открывает оригиналы функций в отдельной вкладке. */
     private async showOriginal(): Promise<void> {
         if (this.round === undefined) {
             return;
         }
-        const doc = await vscode.workspace.openTextDocument({
-            language: 'cpp',
-            content: '// Оригинал функции ' + this.round.name + '\n' +
-                this.round.signature + ' {' + this.round.originalBody + '}\n'
-        });
+        let content = '';
+        for (let i = 0; i < this.round.targets.length; i++) {
+            const t = this.round.targets[i];
+            content += '// Оригинал функции ' + t.name + '\n' + t.signature + ' {' + t.originalBody + '}\n\n';
+        }
+        const doc = await vscode.workspace.openTextDocument({ language: 'cpp', content: content });
         await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true);
     }
 
@@ -468,19 +909,22 @@ class RouletteController {
         return path.join(this.context.globalStorageUri.fsPath, 'last-function-backup.cpp');
     }
 
-    /** Сохраняет оригинал функции в файл, чтобы код не потерялся даже при закрытии VS Code. */
-    private saveBackup(signature: string, body: string): void {
+    /** Сохраняет оригиналы функций в файл, чтобы код не потерялся ни при каких обстоятельствах. */
+    private saveBackup(targets: Target[]): void {
         try {
             fs.mkdirSync(this.context.globalStorageUri.fsPath, { recursive: true });
-            const header = '// Code Roulette: резервная копия от ' + new Date().toLocaleString() +
+            let content = '// Code Roulette: резервная копия от ' + new Date().toLocaleString() +
                 '\n// Файл: ' + (this.uri ? this.uri.fsPath : '') + '\n';
-            fs.writeFileSync(this.backupPath(), header + signature + ' {' + body + '}\n', 'utf8');
+            for (let i = 0; i < targets.length; i++) {
+                content += targets[i].signature + ' {' + targets[i].originalBody + '}\n\n';
+            }
+            fs.writeFileSync(this.backupPath(), content, 'utf8');
         } catch (e) {
             this.output.appendLine('Не удалось сохранить резервную копию: ' + String(e));
         }
     }
 
-    // ---------- вспомогательное ----------
+    // ======================= вспомогательное =======================
 
     /** Папка проекта для команды проверки: папка рабочей области или папка файла. */
     private projectFolder(uri: vscode.Uri): string {
@@ -489,13 +933,17 @@ class RouletteController {
     }
 
     private resetStatusBar(): void {
-        this.statusBar.text = '🎰 Рулетка';
+        this.statusBar.text = this.exam !== undefined ? '🎓 Экзамен' : '🎰 Рулетка';
         this.statusBar.tooltip = 'Code Roulette: открыть рулетку';
         this.statusBar.backgroundColor = undefined;
     }
 
     private getStats(): Stats {
         return this.context.globalState.get<Stats>(STATS_KEY, emptyStats());
+    }
+
+    private getUnlocked(): string[] {
+        return this.context.globalState.get<string[]>(ACH_KEY, []);
     }
 
     private getRecent(): string[] {
@@ -507,6 +955,10 @@ class RouletteController {
     }
 
     dispose(): void {
+        if (this.round !== undefined) {
+            this.round.lastSeen = Date.now();
+            this.saveRound();
+        }
         this.stopTimer();
     }
 }
@@ -529,6 +981,8 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('codeRoulette.open', () => controller.open()),
         vscode.commands.registerCommand('codeRoulette.giveUp', () => controller.giveUp()),
+        vscode.commands.registerCommand('codeRoulette.startExam', () => controller.startExam()),
+        vscode.commands.registerCommand('codeRoulette.stopExam', () => controller.stopExam()),
         { dispose: () => controller.dispose() }
     );
 }

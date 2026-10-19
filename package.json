@@ -2,7 +2,7 @@
   "name": "code-roulette",
   "displayName": "Code Roulette",
   "description": "Рулетка выбирает случайную функцию, стирает её тело — успей написать заново, пока идёт таймер",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "nekikos",
   "repository": {
     "type": "git",
@@ -16,6 +16,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onLanguage:cpp",
     "onLanguage:c"
   ],
@@ -29,6 +30,14 @@
       {
         "command": "codeRoulette.giveUp",
         "title": "Code Roulette: сдаться и вернуть функцию"
+      },
+      {
+        "command": "codeRoulette.startExam",
+        "title": "Code Roulette: начать экзамен (для практика)"
+      },
+      {
+        "command": "codeRoulette.stopExam",
+        "title": "Code Roulette: остановить экзамен (нужен PIN)"
       }
     ],
     "configuration": {

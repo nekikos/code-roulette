@@ -17,9 +17,18 @@
         <h1 class="logo"><span class="flicker">CODE</span> ROULETTE</h1>
         <div class="header-right">
             <span id="file" class="chip">нет файла</span>
+            <button id="trophies" class="icon-btn" title="Достижения">🏆</button>
             <button id="sound" class="icon-btn" title="Звук">🔊</button>
         </div>
     </header>
+
+    <!-- Полоса экзамена: видна, только пока идёт экзамен -->
+    <div id="exam-bar" class="exam-bar hidden">
+        <span class="exam-tag">🎓 ЭКЗАМЕН</span>
+        <span id="exam-student" class="exam-student">—</span>
+        <span id="exam-round" class="exam-round">РАУНД 1/3</span>
+        <span id="exam-rules" class="exam-rules">5 мин · средний</span>
+    </div>
 
     <main>
         <!-- Экран 1: колесо -->
@@ -32,11 +41,19 @@
 
             <p id="empty" class="hint hidden">В открытом файле нет подходящих функций.<br>Открой .cpp файл и нажми «Обновить».</p>
 
-            <div class="time-select" id="times">
-                <span class="label">ВРЕМЯ</span>
-                <button class="seg" data-min="3">3 МИН</button>
-                <button class="seg active" data-min="5">5 МИН</button>
-                <button class="seg" data-min="10">10 МИН</button>
+            <div id="setup" class="setup">
+                <div class="time-select" id="levels">
+                    <span class="label">СЛОЖНОСТЬ</span>
+                    <button class="seg lvl" data-level="easy" title="Короткие функции">🟢 ЛЕГКО</button>
+                    <button class="seg lvl active" data-level="medium" title="Любые функции">🟡 НОРМ</button>
+                    <button class="seg lvl" data-level="hard" title="Длинные функции, две за раунд">🔴 АД</button>
+                </div>
+                <div class="time-select" id="times">
+                    <span class="label">ВРЕМЯ</span>
+                    <button class="seg tm" data-min="3">3 МИН</button>
+                    <button class="seg tm active" data-min="5">5 МИН</button>
+                    <button class="seg tm" data-min="10">10 МИН</button>
+                </div>
             </div>
 
             <div class="actions">
@@ -48,9 +65,9 @@
         <!-- Экран 2: решение с таймером -->
         <section id="view-solve" class="view">
             <div class="card">
-                <div class="card-label">ВЫПАЛА ФУНКЦИЯ</div>
-                <div id="solve-name" class="fn-name">name</div>
-                <code id="solve-sig" class="signature">signature</code>
+                <div id="solve-label" class="card-label">ВЫПАЛА ФУНКЦИЯ</div>
+                <div id="solve-names"></div>
+                <div id="solve-level" class="level-chip"></div>
             </div>
 
             <div class="timer-wrap">
@@ -63,8 +80,14 @@
 
             <p class="hint">Тело функции стёрто — напиши его заново в редакторе слева.</p>
 
+            <div id="hints-box" class="hints-box hidden">
+                <div class="card-label">💡 ПОДСКАЗКИ</div>
+                <ol id="hints-list"></ol>
+            </div>
+
             <div class="actions">
                 <button id="done" class="btn btn-success"><span>✔ ГОТОВО</span></button>
+                <button id="hint" class="btn btn-hint"><span>💡 ПОДСКАЗКА <small>−60с</small></span></button>
                 <button id="giveup" class="btn btn-danger"><span>✖ СДАТЬСЯ</span></button>
             </div>
         </section>
@@ -80,8 +103,19 @@
         <section id="view-result" class="view">
             <div id="result-title" class="result-title">ПОБЕДА!</div>
             <p id="result-text" class="result-text"></p>
+
+            <div id="new-ach" class="new-ach hidden"></div>
+
+            <div id="journal-box" class="journal-box hidden">
+                <div class="card-label">📓 ЖУРНАЛ РАУНДА</div>
+                <ul id="journal-list"></ul>
+            </div>
+
+            <div id="exam-summary" class="exam-summary hidden"></div>
+
             <div class="actions column">
-                <button id="again" class="btn btn-primary"><span>🎰 ЕЩЁ РАЗ</span></button>
+                <button id="again" class="btn btn-primary"><span id="again-text">🎰 ЕЩЁ РАЗ</span></button>
+                <button id="report" class="btn btn-primary hidden"><span>📄 ОТКРЫТЬ ОТЧЁТ</span></button>
                 <div class="actions">
                     <button id="original" class="btn btn-ghost">👁 Показать оригинал</button>
                     <button id="restore" class="btn btn-ghost">↩ Вернуть оригинал</button>
@@ -99,11 +133,33 @@
 
     <div id="toast" class="toast"></div>
 
+    <!-- Окно достижений -->
+    <div id="ach-modal" class="modal hidden">
+        <div class="modal-card">
+            <div class="modal-head">
+                <span>🏆 ДОСТИЖЕНИЯ <small id="ach-count">0/9</small></span>
+                <button id="ach-close" class="icon-btn" title="Закрыть">✕</button>
+            </div>
+            <div id="ach-grid" class="ach-grid"></div>
+        </div>
+    </div>
+
+    <!-- Всплывающее «новое достижение» -->
+    <div id="ach-pop" class="ach-pop">
+        <div id="ach-pop-icon" class="ach-pop-icon">🏆</div>
+        <div>
+            <div class="ach-pop-label">НОВОЕ ДОСТИЖЕНИЕ</div>
+            <div id="ach-pop-title" class="ach-pop-title">—</div>
+        </div>
+    </div>
+
     <div class="cheat-banner">
         <div class="cheat-title">🚫 ЧИТЕР!</div>
         <div class="cheat-sub">Ctrl+Z и вставка оригинала не работают</div>
         <div id="cheat-text" class="cheat-penalty">−30 СЕК</div>
     </div>
+
+    <div id="double" class="double-banner">⚡ ДВОЙНОЙ УДАР ⚡</div>
 
     <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
 </body>
