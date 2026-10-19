@@ -1,0 +1,60 @@
+{
+  "name": "code-roulette",
+  "displayName": "Code Roulette",
+  "description": "Рулетка выбирает случайную функцию, стирает её тело — успей написать заново, пока идёт таймер",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Education",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:cpp",
+    "onLanguage:c"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeRoulette.open",
+        "title": "Code Roulette: открыть рулетку"
+      },
+      {
+        "command": "codeRoulette.giveUp",
+        "title": "Code Roulette: сдаться и вернуть функцию"
+      }
+    ],
+    "configuration": {
+      "title": "Code Roulette",
+      "properties": {
+        "codeRoulette.checkCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Команда проверки решения (запускается в папке проекта). Код выхода 0 — победа. Например: cmake --build build && ctest --test-dir build"
+        },
+        "codeRoulette.skipMain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Не выбирать функцию main"
+        },
+        "codeRoulette.minLines": {
+          "type": "number",
+          "default": 2,
+          "description": "Минимальное число строк в теле функции, чтобы она участвовала в рулетке"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node ./out/test/run.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}

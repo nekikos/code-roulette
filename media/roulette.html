@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}'; img-src {{cspSource}} data:;">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{styleUri}}">
+    <title>Code Roulette</title>
+</head>
+<body>
+    <div class="bg-grid"></div>
+    <div class="scanlines"></div>
+    <canvas id="confetti"></canvas>
+
+    <header>
+        <h1 class="logo"><span class="flicker">CODE</span> ROULETTE</h1>
+        <div class="header-right">
+            <span id="file" class="chip">нет файла</span>
+            <button id="sound" class="icon-btn" title="Звук">🔊</button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Экран 1: колесо -->
+        <section id="view-wheel" class="view active">
+            <div class="wheel-wrap">
+                <div class="pointer"></div>
+                <canvas id="wheel" width="760" height="760"></canvas>
+                <button id="hub" class="hub" title="Крутить">SPIN</button>
+            </div>
+
+            <p id="empty" class="hint hidden">В открытом файле нет подходящих функций.<br>Открой .cpp файл и нажми «Обновить».</p>
+
+            <div class="time-select" id="times">
+                <span class="label">ВРЕМЯ</span>
+                <button class="seg" data-min="3">3 МИН</button>
+                <button class="seg active" data-min="5">5 МИН</button>
+                <button class="seg" data-min="10">10 МИН</button>
+            </div>
+
+            <div class="actions">
+                <button id="spin" class="btn btn-primary"><span>🎰 КРУТИТЬ</span></button>
+                <button id="refresh" class="btn btn-ghost">↻ Обновить</button>
+            </div>
+        </section>
+
+        <!-- Экран 2: решение с таймером -->
+        <section id="view-solve" class="view">
+            <div class="card">
+                <div class="card-label">ВЫПАЛА ФУНКЦИЯ</div>
+                <div id="solve-name" class="fn-name">name</div>
+                <code id="solve-sig" class="signature">signature</code>
+            </div>
+
+            <div class="timer-wrap">
+                <svg class="ring" viewBox="0 0 220 220">
+                    <circle class="ring-bg" cx="110" cy="110" r="96"></circle>
+                    <circle id="ring" class="ring-fg" cx="110" cy="110" r="96"></circle>
+                </svg>
+                <div id="timer" class="timer">05:00</div>
+            </div>
+
+            <p class="hint">Тело функции стёрто — напиши его заново в редакторе слева.</p>
+
+            <div class="actions">
+                <button id="done" class="btn btn-success"><span>✔ ГОТОВО</span></button>
+                <button id="giveup" class="btn btn-danger"><span>✖ СДАТЬСЯ</span></button>
+            </div>
+        </section>
+
+        <!-- Экран 3: проверка -->
+        <section id="view-check" class="view">
+            <div class="loader"><div></div><div></div><div></div></div>
+            <div class="checking">ПРОВЕРЯЮ<span class="dots"></span></div>
+            <p class="hint">Собираю проект и запускаю тесты</p>
+        </section>
+
+        <!-- Экран 4: результат -->
+        <section id="view-result" class="view">
+            <div id="result-title" class="result-title">ПОБЕДА!</div>
+            <p id="result-text" class="result-text"></p>
+            <div class="actions column">
+                <button id="again" class="btn btn-primary"><span>🎰 ЕЩЁ РАЗ</span></button>
+                <div class="actions">
+                    <button id="original" class="btn btn-ghost">👁 Показать оригинал</button>
+                    <button id="restore" class="btn btn-ghost">↩ Вернуть оригинал</button>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="stats">
+        <div class="stat"><span id="st-wins" class="num cyan">0</span><span class="cap">ПОБЕДЫ</span></div>
+        <div class="stat"><span id="st-losses" class="num pink">0</span><span class="cap">ПОРАЖЕНИЯ</span></div>
+        <div class="stat"><span id="st-streak" class="num yellow">0</span><span class="cap">СЕРИЯ 🔥</span></div>
+        <div class="stat"><span id="st-best" class="num violet">—</span><span class="cap">РЕКОРД</span></div>
+    </footer>
+
+    <div id="toast" class="toast"></div>
+
+    <div class="cheat-banner">
+        <div class="cheat-title">🚫 ЧИТЕР!</div>
+        <div class="cheat-sub">Ctrl+Z и вставка оригинала не работают</div>
+        <div id="cheat-text" class="cheat-penalty">−30 СЕК</div>
+    </div>
+
+    <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>
