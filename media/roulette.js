@@ -25,6 +25,8 @@
     let examActive = false;
     let allAchievements = [];
     let unlocked = [];
+    let defaultCommand = '';   // команда проверки из настроек — подставляется в форму экзамена
+    const examForm = { rounds: 3, minutes: 5, level: 'medium' };
 
     // ---------- звук (короткие сигналы через Web Audio) ----------
     let audio = null;
@@ -288,6 +290,7 @@
         examActive = !!exam;
         $('exam-bar').classList.toggle('hidden', !examActive);
         $('setup').classList.toggle('hidden', examActive); // время и сложность на экзамене задаёт практик
+        $('exam-btn').classList.toggle('hidden', examActive);
         if (examActive) {
             $('exam-student').textContent = exam.student;
             $('exam-round').textContent = 'РАУНД ' + exam.round + '/' + exam.rounds;
@@ -443,10 +446,96 @@
         renderAchievements();
         $('ach-modal').classList.remove('hidden');
     });
-    $('ach-close').addEventListener('click', () => $('ach-modal').classList.add('hidden'));
-    $('ach-modal').addEventListener('click', (e) => {
-        if (e.target === $('ach-modal')) {
-            $('ach-modal').classList.add('hidden');
+    // любое окно закрывается крестиком или кликом по тёмному фону
+    const closers = document.querySelectorAll('.modal-close');
+    for (let i = 0; i < closers.length; i++) {
+        closers[i].addEventListener('click', () => $(closers[i].dataset.modal).classList.add('hidden'));
+    }
+    const modals = document.querySelectorAll('.modal');
+    for (let i = 0; i < modals.length; i++) {
+        modals[i].addEventListener('click', (e) => {
+            if (e.target === modals[i]) {
+                modals[i].classList.add('hidden');
+            }
+        });
+    }
+
+    // ---------- экзамен: форма практика и остановка по PIN ----------
+    $('exam-btn').addEventListener('click', () => {
+        if (examActive) {
+            toast('🎓 Экзамен уже идёт');
+            return;
+        }
+        $('ex-command').value = defaultCommand;
+        $('ex-pin').value = '';
+        $('ex-pin2').value = '';
+        $('ex-error').textContent = '';
+        $('exam-modal').classList.remove('hidden');
+        $('ex-student').focus();
+    });
+
+    // подсвечивает поле с ошибкой и пишет, что не так
+    function formError(errorId, inputId, text) {
+        $(errorId).textContent = text;
+        if (inputId) {
+            const input = $(inputId);
+            input.classList.remove('bad');
+            void input.offsetWidth;
+            input.classList.add('bad');
+            input.focus();
+        }
+        beep(180, 0.15, 'sawtooth', 0.04);
+    }
+
+    function submitExam() {
+        const student = $('ex-student').value.trim();
+        const pin = $('ex-pin').value;
+        if (student === '') {
+            formError('ex-error', 'ex-student', 'Введите ФИО студента');
+            return;
+        }
+        if (pin.length < 4) {
+            formError('ex-error', 'ex-pin', 'PIN — минимум 4 символа');
+            return;
+        }
+        if (pin !== $('ex-pin2').value) {
+            formError('ex-error', 'ex-pin2', 'PIN не совпадает');
+            return;
+        }
+        vscode.postMessage({
+            type: 'startExam',
+            student: student,
+            rounds: examForm.rounds,
+            minutes: examForm.minutes,
+            difficulty: examForm.level,
+            hintsAllowed: $('ex-hints').checked,
+            checkCommand: $('ex-command').value.trim(),
+            pin: pin
+        });
+    }
+
+    $('ex-start').addEventListener('click', submitExam);
+    $('ex-pin2').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            submitExam();
+        }
+    });
+
+    $('exam-stop').addEventListener('click', () => {
+        $('stop-pin').value = '';
+        $('stop-error').textContent = '';
+        $('stop-modal').classList.remove('hidden');
+        $('stop-pin').focus();
+    });
+
+    function submitStop() {
+        vscode.postMessage({ type: 'stopExam', pin: $('stop-pin').value });
+    }
+
+    $('stop-confirm').addEventListener('click', submitStop);
+    $('stop-pin').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            submitStop();
         }
     });
 
@@ -468,6 +557,9 @@
         minutes = Number(b.dataset.min);
         beep(500 + minutes * 40, 0.06, 'square', 0.04);
     });
+    segGroup('.seg.ex-rounds', (b) => { examForm.rounds = Number(b.dataset.v); });
+    segGroup('.seg.ex-min', (b) => { examForm.minutes = Number(b.dataset.v); });
+    segGroup('.seg.ex-level', (b) => { examForm.level = b.dataset.v; });
     segGroup('.seg.lvl', (b) => {
         level = b.dataset.level;
         beep(level === 'hard' ? 220 : level === 'easy' ? 880 : 520, 0.08, 'square', 0.04);
@@ -492,12 +584,17 @@
                 $('empty').classList.toggle('hidden', functions.length > 0);
                 setStats(msg.stats);
                 setExam(msg.exam);
+                if (msg.defaultCommand !== undefined) {
+                    defaultCommand = msg.defaultCommand;
+                }
                 if (msg.achievements) {
                     allAchievements = msg.achievements.all;
                     unlocked = msg.achievements.unlocked;
                 }
                 drawWheel();
-                if (msg.game) {
+                if (msg.locked) {
+                    showLock(msg.locked);
+                } else if (msg.game) {
                     showSolving(msg.game);
                 } else {
                     show('wheel');
@@ -531,6 +628,31 @@
                 break;
             case 'notice':
                 toast(msg.text);
+                break;
+            case 'examStarted':
+                $('exam-modal').classList.add('hidden');
+                $('ex-pin').value = '';
+                $('ex-pin2').value = '';
+                toast('🎓 Экзамен начат — передайте компьютер студенту');
+                playNotes([523, 784, 1046], 120, 'triangle', 0.07, 0.2);
+                break;
+            case 'locked':
+                showLock(msg);
+                break;
+            case 'lockWrong':
+                formError('lock-error', 'lock-pin', '❌ Неверный PIN' + (msg.count > 1 ? ' (попыток: ' + msg.count + ')' : ''));
+                $('lock-pin').value = '';
+                break;
+            case 'examError':
+                formError('ex-error', null, msg.message);
+                break;
+            case 'pinWrong':
+                formError('stop-error', 'stop-pin', '❌ Неверный PIN');
+                $('stop-pin').value = '';
+                break;
+            case 'examStopped':
+                $('stop-modal').classList.add('hidden');
+                toast('⏹ Экзамен остановлен, отчёт сохранён');
                 break;
             case 'restored':
                 $('restore').disabled = true;
@@ -581,7 +703,40 @@
         setTimeout(() => document.body.classList.remove('cheat'), 1800);
     }
 
+    function showLock(info) {
+        $('lock-round').textContent = 'РАУНД ' + info.round + '/' + info.rounds;
+        $('lock-error').textContent = '';
+        $('lock-pin').value = '';
+        document.querySelector('.lock-icon').classList.remove('open');
+        show('lock');
+        playNotes([330, 262], 220, 'square', 0.05, 0.25);
+        setTimeout(() => $('lock-pin').focus(), 300);
+    }
+
+    function submitUnlock() {
+        vscode.postMessage({ type: 'unlock', pin: $('lock-pin').value });
+    }
+
+    $('lock-open').addEventListener('click', submitUnlock);
+    $('lock-pin').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            submitUnlock();
+        }
+    });
+
     function showResult(r) {
+        const lockView = $('view-lock');
+        if (lockView.classList.contains('active')) {
+            // замок открывается — и только потом показываем результат
+            document.querySelector('.lock-icon').classList.add('open');
+            playNotes([523, 659, 784], 90, 'triangle', 0.06, 0.15);
+            setTimeout(() => revealResult(r), 650);
+            return;
+        }
+        revealResult(r);
+    }
+
+    function revealResult(r) {
         const title = $('result-title');
         title.textContent = r.win ? 'ПОБЕДА!' : 'ПОРАЖЕНИЕ';
         title.className = 'result-title ' + (r.win ? 'win' : 'lose');
@@ -665,11 +820,14 @@
         let timer = null;
         let picked = [0];
         let hints = 0;
+        let sealed = null;
+        let wrong = 0;
         const send = (m) => setTimeout(() => window.dispatchEvent(new MessageEvent('message', { data: m })), 50);
         return {
             postMessage(m) {
                 if (m.type === 'ready' || m.type === 'refresh' || m.type === 'again') {
                     send({ type: 'init', file: 'demo.cpp', functions: demo, stats: stats, exam: exam,
+                        defaultCommand: 'cmake --build build && ctest --test-dir build',
                         achievements: { all: ach, unlocked: ['first_win'] } });
                 } else if (m.type === 'spin') {
                     const a = Math.floor(Math.random() * demo.length);
@@ -691,11 +849,29 @@
                 } else if (m.type === 'hint') {
                     hints++;
                     send({ type: 'hint', text: ['int pivot = a[r];', 'int i = l - 1;', 'for (int j = l; j < r; j++) {'][(hints - 1) % 3], penalty: 60 });
+                } else if (m.type === 'unlock') {
+                    if (m.pin === '1234') {
+                        send(sealed);
+                    } else {
+                        wrong++;
+                        send({ type: 'lockWrong', count: wrong });
+                    }
                 } else if (m.type === 'done' || m.type === 'giveUp') {
                     clearInterval(timer);
                     const win = m.type === 'done';
                     send({ type: 'checking' });
                     setTimeout(() => {
+                        if (exam) {
+                            wrong = 0;
+                            sealed = {
+                                type: 'result', win: win, stats: stats, canRestore: !win,
+                                text: win ? 'Написано за 01:35: partition.\nПроверка пройдена ✔' : 'Ты сдался. Оригинал возвращён.',
+                                journal: [], achievements: [], unlocked: ['first_win'],
+                                exam: { round: 1, rounds: 3, finished: false, wins: win ? 1 : 0 }
+                            };
+                            send({ type: 'locked', round: 1, rounds: 3 });
+                            return;
+                        }
                         stats = win ? { wins: stats.wins + 1, losses: stats.losses, streak: stats.streak + 1, bestSeconds: 95 }
                                     : { wins: stats.wins, losses: stats.losses + 1, streak: 0, bestSeconds: stats.bestSeconds };
                         send({
@@ -709,6 +885,20 @@
                     }, win ? 1500 : 10);
                 } else if (m.type === 'restore') {
                     send({ type: 'restored' });
+                } else if (m.type === 'startExam') {
+                    send({ type: 'examStarted' });
+                    send({ type: 'init', file: 'demo.cpp', functions: demo, stats: stats,
+                        exam: { student: m.student, round: 1, rounds: m.rounds, minutes: m.minutes,
+                            difficultyName: m.difficulty, hintsAllowed: m.hintsAllowed },
+                        achievements: { all: ach, unlocked: ['first_win'] } });
+                } else if (m.type === 'stopExam') {
+                    if (m.pin === '1234') {
+                        send({ type: 'examStopped' });
+                        send({ type: 'init', file: 'demo.cpp', functions: demo, stats: stats, exam: null,
+                            achievements: { all: ach, unlocked: ['first_win'] } });
+                    } else {
+                        send({ type: 'pinWrong' });
+                    }
                 }
             }
         };

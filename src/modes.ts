@@ -203,6 +203,13 @@ export interface RoundResult {
 export interface Exam {
     config: ExamConfig;
     results: RoundResult[];
+    /**
+     * Результат последнего раунда, закрытый замком: студент его не видит,
+     * пока практик не введёт PIN. undefined — замка нет.
+     */
+    sealed?: object;
+    /** Сколько раз на замке ввели неверный PIN. */
+    wrongPins?: number;
 }
 
 /** Хеш PIN-кода с солью (SHA-256). */

@@ -2,7 +2,7 @@
   "name": "code-roulette",
   "displayName": "Code Roulette",
   "description": "Рулетка выбирает случайную функцию, стирает её тело — успей написать заново, пока идёт таймер",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "nekikos",
   "repository": {
     "type": "git",

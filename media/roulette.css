@@ -1039,6 +1039,219 @@ body.cheat main {
     100% { opacity: 0; transform: translate(-50%, -50%) scale(1.05); }
 }
 
+/* ---------- замок практика ---------- */
+.lock-icon {
+    margin-top: 30px;
+    font-size: 84px;
+    filter: drop-shadow(0 0 18px var(--yellow)) drop-shadow(0 0 40px rgba(255, 230, 0, 0.5));
+    animation: lock-swing 2.6s ease-in-out infinite;
+}
+
+@keyframes lock-swing {
+    0%, 100% { transform: rotate(0); }
+    10% { transform: rotate(-10deg); }
+    20% { transform: rotate(8deg); }
+    30% { transform: rotate(-4deg); }
+    40% { transform: rotate(0); }
+}
+
+.lock-icon.open {
+    animation: lock-open 0.6s ease-out forwards;
+}
+
+@keyframes lock-open {
+    to { transform: scale(1.4) rotate(-20deg); opacity: 0; }
+}
+
+.lock-title {
+    font-size: 34px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    color: #fff;
+    text-shadow: 0 0 8px var(--yellow), 0 0 24px var(--yellow);
+    text-align: center;
+}
+
+.lock-round {
+    font-family: var(--mono);
+    font-weight: 700;
+    color: var(--cyan);
+    text-shadow: 0 0 8px var(--cyan);
+    letter-spacing: 2px;
+}
+
+.lock-form {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+}
+
+#lock-pin {
+    width: 200px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    border: 1px solid var(--yellow);
+    background: rgba(8, 4, 20, 0.85);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 18px;
+    letter-spacing: 4px;
+    text-align: center;
+    outline: none;
+    box-shadow: 0 0 14px rgba(255, 230, 0, 0.35);
+}
+
+#lock-pin:focus {
+    box-shadow: 0 0 22px rgba(255, 230, 0, 0.7);
+}
+
+#lock-pin.bad {
+    border-color: var(--red);
+    box-shadow: 0 0 18px rgba(255, 56, 96, 0.7);
+    animation: shake 0.4s;
+}
+
+/* ---------- формы (экзамен, PIN) ---------- */
+.exam-card,
+.pin-card {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.pin-card {
+    max-width: 380px;
+}
+
+.hint.left {
+    text-align: left;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    letter-spacing: 1px;
+    color: var(--muted);
+}
+
+.field small {
+    letter-spacing: 0;
+    opacity: 0.8;
+}
+
+.field .time-select {
+    align-self: flex-start;
+}
+
+.field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.field input[type="text"],
+.field input[type="password"] {
+    width: 100%;
+    padding: 11px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(157, 77, 255, 0.5);
+    background: rgba(8, 4, 20, 0.8);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.field input:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.45);
+}
+
+.field input.bad {
+    border-color: var(--red);
+    box-shadow: 0 0 12px rgba(255, 56, 96, 0.5);
+    animation: shake 0.4s;
+}
+
+/* переключатель «подсказки» */
+.toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    color: var(--text);
+    font-size: 14px;
+    letter-spacing: 0;
+}
+
+.toggle input {
+    display: none;
+}
+
+.switch {
+    position: relative;
+    flex: none;
+    width: 46px;
+    height: 26px;
+    border-radius: 999px;
+    border: 1px solid rgba(157, 77, 255, 0.6);
+    background: rgba(8, 4, 20, 0.8);
+    transition: all 0.25s;
+}
+
+.switch::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: all 0.25s cubic-bezier(.2, 1.4, .4, 1);
+}
+
+.toggle input:checked + .switch {
+    border-color: var(--yellow);
+    box-shadow: 0 0 12px rgba(255, 230, 0, 0.5);
+}
+
+.toggle input:checked + .switch::after {
+    left: 23px;
+    background: var(--yellow);
+    box-shadow: 0 0 10px var(--yellow);
+}
+
+.form-error {
+    margin: 0;
+    min-height: 18px;
+    color: var(--red);
+    font-size: 13px;
+    text-shadow: 0 0 6px rgba(255, 56, 96, 0.6);
+}
+
+.stop-btn {
+    border: 1px solid var(--red);
+    border-radius: 10px;
+    background: rgba(255, 56, 96, 0.12);
+    color: var(--red);
+    font-weight: 900;
+    font-size: 11px;
+    letter-spacing: 1px;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: box-shadow 0.2s;
+}
+
+.stop-btn:hover {
+    box-shadow: 0 0 12px rgba(255, 56, 96, 0.7);
+}
+
 @media (max-width: 420px) {
     .logo { font-size: 20px; letter-spacing: 2px; }
     .btn-primary span, .btn-success span, .btn-danger span { padding: 10px 20px; }
@@ -1046,4 +1259,5 @@ body.cheat main {
     .stats { grid-template-columns: repeat(2, 1fr); }
     .double-banner { font-size: 26px; }
     .exam-rules { margin-left: 0; }
+    .field-row { grid-template-columns: 1fr; }
 }

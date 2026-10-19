@@ -56,6 +56,18 @@ interface Round {
     focusLostAt: number;
 }
 
+/** Сообщение от панели: тип и необязательные поля (время, сложность, форма экзамена, PIN). */
+interface PanelMessage {
+    type: string;
+    minutes?: number;
+    difficulty?: Difficulty;
+    student?: string;
+    rounds?: number;
+    hintsAllowed?: boolean;
+    checkCommand?: string;
+    pin?: string;
+}
+
 class RouletteController {
     private panel: vscode.WebviewPanel | undefined;
     private state: GameState = 'idle';
@@ -85,6 +97,10 @@ class RouletteController {
         context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => this.watchEdits(e)));
         context.subscriptions.push(vscode.window.onDidChangeWindowState(s => this.watchFocus(s.focused)));
         this.resumeRound();
+        if (this.isLocked()) {
+            this.state = 'finished';
+            this.showLock();
+        }
     }
 
     // ======================= панель =======================
@@ -121,7 +137,7 @@ class RouletteController {
     }
 
     /** Обработка нажатий кнопок в панели. */
-    private async onMessage(msg: { type: string; minutes?: number; difficulty?: Difficulty }): Promise<void> {
+    private async onMessage(msg: PanelMessage): Promise<void> {
         switch (msg.type) {
             case 'ready':
             case 'refresh':
@@ -153,6 +169,15 @@ class RouletteController {
                 break;
             case 'openReport':
                 this.openReport();
+                break;
+            case 'startExam':
+                this.startExamFromPanel(msg);
+                break;
+            case 'stopExam':
+                await this.stopExamWithPin(msg.pin || '');
+                break;
+            case 'unlock':
+                this.unlock(msg.pin || '');
                 break;
             case 'again':
                 if (canTransition(this.state, 'idle')) {
@@ -212,6 +237,8 @@ class RouletteController {
             stats: this.getStats(),
             game: game,
             exam: this.examInfo(),
+            locked: this.isLocked() ? this.lockInfo() : null,
+            defaultCommand: vscode.workspace.getConfiguration('codeRoulette').get<string>('checkCommand', ''),
             achievements: { all: ACHIEVEMENTS, unlocked: this.getUnlocked() }
         });
     }
@@ -248,6 +275,11 @@ class RouletteController {
     /** Кнопка «Крутить»: выбираем функции и просим панель прокрутить колесо до них. */
     private async spin(minutes: number, difficulty: Difficulty): Promise<void> {
         if (!canTransition(this.state, 'spinning')) {
+            return;
+        }
+        if (this.isLocked()) {
+            this.post({ type: 'error', message: 'Сначала практик должен открыть результат раунда' });
+            this.showLock();
             return;
         }
         if (this.uri === undefined) {
@@ -332,6 +364,9 @@ class RouletteController {
         await this.revealTarget(0);
         this.post({ type: 'solving', ...this.solvingInfo() });
         this.startTimer();
+        if (this.exam !== undefined) {
+            this.enterZen();
+        }
     }
 
     /** Переводит курсор на строку с TODO в стёртой функции. */
@@ -504,11 +539,6 @@ class RouletteController {
                 finished: done,
                 wins: this.exam.results.filter(x => x.win).length
             };
-            if (done) {
-                this.writeReport(false);
-            } else {
-                this.context.globalState.update(EXAM_KEY, this.exam);
-            }
         }
 
         // достижения
@@ -520,16 +550,97 @@ class RouletteController {
         this.context.globalState.update(ACH_KEY, unlocked.concat(fresh.map(a => a.id)));
 
         const canRestore = r.targets.some(t => !t.restored);
-        this.post({
+        const result = {
             type: 'result', win: win, text: text, stats: stats, canRestore: canRestore,
             journal: suspiciousLines(summarize(r.events)),
             achievements: fresh,
             unlocked: this.getUnlocked(),
             exam: examResult
-        });
+        };
+
+        // экзамен: результат закрывается замком до PIN практика
+        if (this.exam !== undefined) {
+            this.exam.sealed = result;
+            this.exam.wrongPins = 0;
+            this.context.globalState.update(EXAM_KEY, this.exam);
+            this.showLock();
+            return;
+        }
+        this.post(result);
         if (this.panel === undefined) {
             vscode.window.showInformationMessage((win ? '🎉 Победа! ' : '💀 Поражение. ') + text.split('\n')[0]);
         }
+    }
+
+    // ======================= замок практика =======================
+
+    /** Висит ли замок: раунд экзамена закончен, а практик ещё не ввёл PIN. */
+    private isLocked(): boolean {
+        return this.exam !== undefined && this.exam.sealed !== undefined;
+    }
+
+    /** Данные для экрана замка. */
+    private lockInfo(): object {
+        const e = this.exam!;
+        return { round: e.results.length, rounds: e.config.rounds, student: e.config.student };
+    }
+
+    /** Показывает замок на панели и в строке состояния. */
+    private showLock(): void {
+        this.statusBar.text = '🔒 Позовите практика';
+        this.statusBar.tooltip = 'Code Roulette: раунд экзамена завершён, результат откроет практик';
+        this.statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        if (this.panel === undefined) {
+            this.open();
+        }
+        this.post({ type: 'locked', ...this.lockInfo() });
+        if (this.panel === undefined) {
+            vscode.window.showWarningMessage('🔒 Code Roulette: раунд завершён. Позовите практика — результат откроется по PIN.');
+        }
+    }
+
+    /**
+     * Практик ввёл PIN на замке: открываем результат. После последнего раунда —
+     * отчёт и выход из полноэкранного режима.
+     */
+    private unlock(pin: string): void {
+        if (this.exam === undefined || this.exam.sealed === undefined) {
+            return;
+        }
+        if (!checkPin(this.exam, pin)) {
+            this.exam.wrongPins = (this.exam.wrongPins || 0) + 1;
+            this.context.globalState.update(EXAM_KEY, this.exam);
+            this.post({ type: 'lockWrong', count: this.exam.wrongPins });
+            return;
+        }
+        const result = this.exam.sealed as { text: string; exam: { finished: boolean } | null };
+        const last = this.exam.results[this.exam.results.length - 1];
+        if (this.exam.wrongPins && this.exam.wrongPins > 0 && last !== undefined) {
+            const note = '🔐 Неверный PIN на замке: ' + this.exam.wrongPins + ' раз';
+            last.text += '\n' + note;
+            result.text += '\n' + note;
+        }
+        this.exam.sealed = undefined;
+        this.exam.wrongPins = 0;
+        if (examFinished(this.exam)) {
+            this.writeReport(false);
+            this.exitZen();
+        } else {
+            this.context.globalState.update(EXAM_KEY, this.exam);
+        }
+        this.resetStatusBar();
+        this.post(result);
+    }
+
+    /** Полноэкранный режим без отвлекающих панелей (Zen Mode) — на время экзамена. */
+    private enterZen(): void {
+        // toggleZenMode переключает режим, поэтому сначала гарантированно выходим
+        vscode.commands.executeCommand('workbench.action.exitZenMode').then(
+            () => vscode.commands.executeCommand('workbench.action.toggleZenMode'));
+    }
+
+    private exitZen(): void {
+        vscode.commands.executeCommand('workbench.action.exitZenMode');
     }
 
     // ======================= журнал и защита =======================
@@ -710,12 +821,9 @@ class RouletteController {
 
     /** Команда практика: настроить и начать экзамен. */
     async startExam(): Promise<void> {
-        if (this.state === 'solving' || this.state === 'checking' || this.state === 'spinning') {
-            vscode.window.showErrorMessage('Code Roulette: сначала закончи текущий раунд');
-            return;
-        }
-        if (this.exam !== undefined) {
-            vscode.window.showErrorMessage('Code Roulette: экзамен уже идёт. Остановить — командой «Остановить экзамен» (нужен PIN)');
+        const blocker = this.examBlocker();
+        if (blocker !== null) {
+            vscode.window.showErrorMessage('Code Roulette: ' + blocker);
             return;
         }
         const student = await vscode.window.showInputBox({
@@ -777,17 +885,65 @@ class RouletteController {
             vscode.window.showErrorMessage('Code Roulette: PIN не совпал, экзамен не начат');
             return;
         }
-        this.exam = createExam({
+        this.beginExam({
             student: student.trim(), rounds: Number(rounds), minutes: Number(minutes),
             difficulty: level.value, hintsAllowed: hints.startsWith('Разрешить'),
             checkCommand: command.trim(), pin: pin
         });
+        this.open();
+    }
+
+    /** Почему сейчас нельзя начать экзамен (или null, если можно). */
+    private examBlocker(): string | null {
+        if (this.state === 'solving' || this.state === 'checking' || this.state === 'spinning') {
+            return 'Сначала закончи текущий раунд';
+        }
+        if (this.exam !== undefined) {
+            return 'Экзамен уже идёт';
+        }
+        return null;
+    }
+
+    /** Форма «Режим экзамена» на панели: проверяем поля и начинаем экзамен. */
+    private startExamFromPanel(msg: PanelMessage): void {
+        const blocker = this.examBlocker();
+        if (blocker !== null) {
+            this.post({ type: 'examError', message: blocker });
+            return;
+        }
+        const student = (msg.student || '').trim();
+        const pin = msg.pin || '';
+        const rounds = Math.min(5, Math.max(1, Math.floor(msg.rounds || 1)));
+        const minutes = Math.min(60, Math.max(1, Math.floor(msg.minutes || 5)));
+        const levels: Difficulty[] = ['easy', 'medium', 'hard'];
+        const difficulty = msg.difficulty !== undefined && levels.indexOf(msg.difficulty) !== -1 ? msg.difficulty : 'medium';
+        if (student === '') {
+            this.post({ type: 'examError', message: 'Введите ФИО студента' });
+            return;
+        }
+        if (pin.length < 4) {
+            this.post({ type: 'examError', message: 'PIN — минимум 4 символа' });
+            return;
+        }
+        this.beginExam({
+            student: student, rounds: rounds, minutes: minutes, difficulty: difficulty,
+            hintsAllowed: msg.hintsAllowed === true, checkCommand: (msg.checkCommand || '').trim(), pin: pin
+        });
+        this.post({ type: 'examStarted' });
+    }
+
+    /** Создаёт экзамен, сохраняет его и обновляет панель. */
+    private beginExam(settings: {
+        student: string; rounds: number; minutes: number; difficulty: Difficulty;
+        hintsAllowed: boolean; checkCommand: string; pin: string;
+    }): void {
+        this.exam = createExam(settings);
         this.context.globalState.update(EXAM_KEY, this.exam);
         this.state = 'idle';
-        this.open();
+        this.resetStatusBar();
         this.sendInit();
-        vscode.window.showInformationMessage('🎓 Экзамен начат: ' + rounds + ' раунд(ов) по ' + minutes +
-            ' мин. Передайте компьютер студенту.');
+        vscode.window.showInformationMessage('🎓 Экзамен начат: ' + settings.rounds + ' раунд(ов) по ' +
+            settings.minutes + ' мин. Передайте компьютер студенту.');
     }
 
     /** Команда практика: досрочно остановить экзамен (нужен PIN). */
@@ -802,12 +958,25 @@ class RouletteController {
         if (pin === undefined) {
             return;
         }
-        if (!checkPin(this.exam, pin)) {
+        if (!(await this.stopExamWithPin(pin))) {
             vscode.window.showErrorMessage('Code Roulette: неверный PIN');
+        }
+    }
+
+    /**
+     * Останавливает экзамен, если PIN верный: текущий раунд — поражение, отчёт сохраняется.
+     * @returns false, если PIN неверный
+     */
+    private async stopExamWithPin(pin: string): Promise<boolean> {
+        if (this.exam === undefined) {
+            return true;
+        }
+        if (!checkPin(this.exam, pin)) {
+            this.post({ type: 'pinWrong' });
             if (this.round !== undefined && this.state === 'solving') {
                 this.addEvent('finish', 0, 'Попытка остановить экзамен с неверным PIN');
             }
-            return;
+            return false;
         }
         if (this.round !== undefined && (this.state === 'solving' || this.state === 'checking')) {
             this.stopTimer();
@@ -820,8 +989,12 @@ class RouletteController {
             this.resetStatusBar();
         }
         this.writeReport(true);
+        this.exitZen();
         this.state = 'idle';
+        this.resetStatusBar();
+        this.post({ type: 'examStopped' });
         this.sendInit();
+        return true;
     }
 
     /** Сохраняет отчёт экзамена в папку проекта, открывает его и заканчивает экзамен. */
