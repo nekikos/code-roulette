@@ -3,6 +3,11 @@
   "displayName": "Code Roulette",
   "description": "Рулетка выбирает случайную функцию, стирает её тело — успей написать заново, пока идёт таймер",
   "version": "0.1.0",
+  "publisher": "nekikos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nekikos/code-roulette"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -48,6 +53,7 @@
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node ./out/test/run.js"
